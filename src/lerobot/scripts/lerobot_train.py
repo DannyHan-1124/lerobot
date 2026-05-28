@@ -78,7 +78,7 @@ def update_policy(
     Performs a single training step to update the policy's weights.
 
     This function executes the forward and backward passes, clips gradients, and steps the optimizer and
-    learning rate scheduler. Accelerator handles mixed-precision training automatically.
+    learning rate scheduler. Accelerator handles mixed-precision training and gradient accumulation automatically.
 
     Args:
         train_metrics: A MetricsTracker instance to record training statistics.
@@ -86,7 +86,7 @@ def update_policy(
         batch: A batch of training data.
         optimizer: The optimizer used to update the policy's parameters.
         grad_clip_norm: The maximum norm for gradient clipping.
-        accelerator: The Accelerator instance for distributed training and mixed precision.
+        accelerator: The Accelerator instance for distributed training, mixed precision, and gradient accumulation.
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
@@ -105,57 +105,61 @@ def update_policy(
     if sample_weighter is not None:
         sample_weights, weight_stats = sample_weighter.compute_batch_weights(batch)
 
-    # Let accelerator handle mixed precision
-    with accelerator.autocast():
-        if sample_weights is not None:
-            # Use per-sample loss for weighted training
-            # Note: Policies supporting sample weighting must implement forward(batch, reduction="none")
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+    # Use accumulate context manager to handle gradient accumulation
+    with accelerator.accumulate(policy):
+        # Let accelerator handle mixed precision
+        with accelerator.autocast():
+            # Use per-sample loss when RA-BC is enabled for proper weighting
+            if rabc_batch_weights is not None:
+                # Get per-sample losses
+                per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
-            # Weighted loss: each sample's contribution is scaled by its weight.
-            # We divide by weight sum (not batch size) so that if some weights are zero,
-            # the remaining samples contribute proportionally more, preserving gradient scale.
-            # Weights are pre-normalized to sum to batch_size for stable training dynamics.
-            epsilon = 1e-6
-            loss = (per_sample_loss * sample_weights).sum() / (sample_weights.sum() + epsilon)
+                # Apply RA-BC weights: L_RA-BC = Σ(w_i * l_i) / (Σw_i + ε)
+                # rabc_batch_weights is already normalized to sum to batch_size
+                epsilon = 1e-6
+                loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
+                # Log raw mean weight (before normalization) - this is the meaningful metric
+                output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
+                output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
+                output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+            else:
+                loss, output_dict = policy.forward(batch)
 
-            # Log weighting statistics
-            if output_dict is None:
-                output_dict = {}
-            for key, value in weight_stats.items():
-                output_dict[f"sample_weight_{key}"] = value
-        else:
-            loss, output_dict = policy.forward(batch)
+            # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
-        # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+        # Use accelerator's backward method
+        accelerator.backward(loss)
 
-    # Use accelerator's backward method
-    accelerator.backward(loss)
+        if accelerator.sync_gradients:
+            # Clip gradients if specified
+            if grad_clip_norm > 0:
+                grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), float("inf"), error_if_nonfinite=False
+                )
+            train_metrics.grad_norm = grad_norm.item()
 
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+        # Optimizer step
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
 
-    # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
+        optimizer.zero_grad()
 
-    optimizer.zero_grad()
+        # Step through pytorch scheduler at every batch instead of epoch
+        # Only step when optimizer updates parameters (requires manual check with step_scheduler_with_optimizer=False).
+        if lr_scheduler is not None and accelerator.sync_gradients:
+            lr_scheduler.step()
 
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
-
-    # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
-        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+        # Update internal buffers if policy has update method
+        if (
+            has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update")
+            and accelerator.sync_gradients
+        ):
+            accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
     train_metrics.loss = loss.item()
-    train_metrics.grad_norm = grad_norm.item()
+    # NOTE: grad_norm is updated only when gradients are actually applied
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
@@ -200,6 +204,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
+            gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         )
 
     init_logging(accelerator=accelerator)
@@ -251,29 +256,27 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
-    if cfg.is_reward_model_training:
-        if is_main_process:
-            logging.info("Creating reward model")
-        from lerobot.rewards import make_reward_model
+    if is_main_process:
+        logging.info("Creating policy")
 
-        policy = make_reward_model(
-            cfg=cfg.reward_model,
-            dataset_stats=dataset.meta.stats,
-            dataset_meta=dataset.meta,
+    # CUDAGraphs ("max-autotune", "reduce-overhead") is incompatible with
+    # gradient_accumulation_steps > 1 because multiple forward passes before
+    # backward overwrite tensors captured in the graph.
+    if (
+        cfg.gradient_accumulation_steps > 1
+        and getattr(cfg.policy, "compile_model", False)
+        and getattr(cfg.policy, "compile_mode", None) in {"max-autotune", "reduce-overhead"}
+    ):
+        raise ValueError(
+            f"compile_mode='{cfg.policy.compile_mode}' uses CUDAGraphs which is incompatible with "
+            f"gradient_accumulation_steps > 1. Use 'max-autotune-no-cudagraphs' or 'default' instead."
         )
-        if not policy.is_trainable:
-            raise ValueError(
-                f"Reward model '{policy.name}' is zero-shot and cannot be trained via lerobot-train. "
-                "Use it directly for inference via compute_reward() (e.g. offline precompute)."
-            )
-    else:
-        if is_main_process:
-            logging.info("Creating policy")
-        policy = make_policy(
-            cfg=cfg.policy,
-            ds_meta=dataset.meta,
-            rename_map=cfg.rename_map,
-        )
+
+    policy = make_policy(
+        cfg=cfg.policy,
+        ds_meta=dataset.meta,
+        rename_map=cfg.rename_map,
+    )
 
     if cfg.peft is not None:
         if cfg.is_reward_model_training:
@@ -383,8 +386,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        gradient_accumulation_steps = accelerator.gradient_accumulation_steps
+        effective_bs = cfg.batch_size * num_processes * gradient_accumulation_steps
+        logging.info(
+            f"Effective batch size: {cfg.batch_size} x {num_processes} x {gradient_accumulation_steps} = {effective_bs}"
+        )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -460,7 +466,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    for _ in range(step, cfg.steps):
+    while step < cfg.steps:
         start_time = time.perf_counter()
         batch = next(dl_iter)
         for cam_key in dataset.meta.camera_keys:
@@ -479,6 +485,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
         )
+
+        # Skip evaluation and checkpointing during gradient accumulation.
+        if not accelerator.sync_gradients:
+            continue
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
