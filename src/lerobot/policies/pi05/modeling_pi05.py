@@ -1175,10 +1175,19 @@ class PI05Policy(PreTrainedPolicy):
             if img.device != device:
                 img = img.to(device)
 
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
+             # # Ensure float32 dtype for consistency
+            # if img.dtype != torch.float32:
+            #     img = img.to(torch.float32)
 
+            # minor patch: Convert image pixels to float32 in [0, 1].
+            # LeRobot training datasets may return uint8 images in [0, 255].
+            if img.dtype == torch.uint8:
+                img = img.to(torch.float32) / 255.0
+            else:
+                img = img.to(torch.float32)
+                if img.max() > 1.0:
+                    img = img / 255.0
+            
             # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
             is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
 
