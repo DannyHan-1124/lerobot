@@ -3,22 +3,24 @@
 #SBATCH --gres=gpu:4
 #SBATCH --time=1:00:00
 #SBATCH --cpus-per-task=10
-#SBATCH -J test
-#SBATCH -o logs/test/%x_%j.out
-#SBATCH -e logs/test/%x_%j.err
+#SBATCH -J test_deepspeed
+#SBATCH -o logs/test_deepspeed/%x_%j.out
+#SBATCH -e logs/test_deepspeed/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
 
-mkdir -p logs/test
+mkdir -p logs/test_deepspeed
 
 module purge
 module use /software/easybuild/modules/all
 module load FFmpeg/7.1.2-GCCcore-14.3.0
 module load devel/cuda/12.9
 
+. ~/miniforge3/etc/profile.d/conda.sh
 conda activate lerobot
+
 source env_lerobot.sh
 
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
