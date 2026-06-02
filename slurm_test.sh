@@ -1,16 +1,17 @@
 #!/bin/bash
 #SBATCH -p accelerated
-#SBATCH --gres=gpu:1
-#SBATCH --time=05:00
-#SBATCH -J test
-#SBATCH -o logs/test_conda/%x_%j.out
-#SBATCH -e logs/test_conda/%x_%j.err
+#SBATCH --gres=gpu:4
+#SBATCH --time=1:00:00
+#SBATCH --cpus-per-task=10
+#SBATCH -J test_saving_training_state
+#SBATCH -o logs/test_saving_training_state/%x_%j.out
+#SBATCH -e logs/test_saving_training_state/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
 
-mkdir -p logs/test_conda
+mkdir -p logs/test_saving_training_state
 
 module purge
 module use /software/easybuild/modules/all
@@ -39,3 +40,28 @@ print(f"torch.cuda.device_count()={torch.cuda.device_count()}")
 if not torch.cuda.is_available():
     sys.exit("CUDA is not available to PyTorch; aborting instead of falling back to CPU.")
 PY
+
+accelerate launch \
+  --use_deepspeed \
+  --zero_stage=2 \
+  --offload_optimizer_device=none \
+  --num_processes=4 \
+  --mixed_precision=bf16 \
+  "$(which lerobot-train)" \
+  --dataset.repo_id=/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_cube_full \
+  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/test_saving_training_state \
+  --job_name=test \
+  --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
+  --policy.repo_id=local/pi05-test \
+  --policy.push_to_hub=false \
+  --rename_map='{"observation.images.static_cam": "observation.images.base_0_rgb", "observation.images.wrist_cam": "observation.images.left_wrist_0_rgb"}' \
+  --policy.empty_cameras=1 \
+  --policy.dtype=bfloat16 \
+  --policy.device=cuda \
+  --policy.gradient_checkpointing=true \
+  --policy.optimizer_lr=1e-04 \
+  --resume=true \
+  --gradient_accumulation_steps=4 \
+  --steps=20 \
+  --batch_size=8
+

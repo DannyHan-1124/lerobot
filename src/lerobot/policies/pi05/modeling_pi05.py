@@ -710,11 +710,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
+            noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
             return self.action_in_proj(noisy_actions)
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         def time_mlp_func(time_emb):
+            time_emb = time_emb.to(dtype=self.time_mlp_in.weight.dtype)
             x = self.time_mlp_in(time_emb)
             x = F.silu(x)
             x = self.time_mlp_out(x)
@@ -741,12 +743,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def forward(self, images, img_masks, tokens, masks, actions, noise, time) -> Tensor:
         """Do a full training forward pass and compute the loss."""
+
+        model_dtype = self.action_in_proj.weight.dtype
+
+        actions = actions.to(dtype=model_dtype)
+        noise = noise.to(dtype=model_dtype)
+        time = time.to(dtype=model_dtype)
+        
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+
+        prefix_embs = prefix_embs.to(dtype=model_dtype)
+        suffix_embs = suffix_embs.to(dtype=model_dtype)
+        adarms_cond = adarms_cond.to(dtype=model_dtype)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -779,13 +792,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
 
         def action_out_proj_func(suffix_out):
+            suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
+        u_t = u_t.to(dtype=v_t.dtype)
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
@@ -904,7 +919,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         return self.action_out_proj(suffix_out)
 
 
@@ -1122,6 +1137,15 @@ class PI05Policy(PreTrainedPolicy):
 
     def get_optim_params(self) -> dict:
         return self.parameters()
+    
+    def state_dict(self, *args, **kwargs):
+        state_dict = super().state_dict(*args, **kwargs)
+
+        for key, value in list(state_dict.items()):
+            if isinstance(value, torch.Tensor):
+                state_dict[key] = value.detach().clone()
+
+        return state_dict
 
     def reset(self):
         """Reset internal state - called when environment resets."""
@@ -1287,7 +1311,7 @@ class PI05Policy(PreTrainedPolicy):
         losses = losses[:, :, :original_action_dim]
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": losses.mean(dim=[0, 1]).detach().float().cpu().numpy().tolist(),
         }
 
         if reduction == "none":

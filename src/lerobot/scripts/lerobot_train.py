@@ -138,7 +138,7 @@ def update_policy(
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), float("inf"), error_if_nonfinite=False
                 )
-            train_metrics.grad_norm = grad_norm.item()
+            train_metrics.grad_norm = float(grad_norm)
 
         # Optimizer step
         with lock if lock is not None else nullcontext():
@@ -186,6 +186,23 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     require_package("accelerate", extra="training")
     from accelerate import Accelerator
+
+    cfg.validate()
+
+    if cfg.resume and cfg.checkpoint_path is None:
+        cfg.checkpoint_path = cfg.output_dir / "checkpoints" / "last"
+    
+    if cfg.resume:
+        checkpoint_cfg = TrainPipelineConfig.from_pretrained(
+            cfg.checkpoint_path / "pretrained_model"
+        )
+
+        checkpoint_cfg.resume = True
+        checkpoint_cfg.output_dir = cfg.output_dir
+        checkpoint_cfg.checkpoint_path = cfg.checkpoint_path
+        checkpoint_cfg.steps = cfg.steps
+
+        cfg = checkpoint_cfg
 
     cfg.validate()
 
@@ -368,9 +385,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     step = 0  # number of policy updates (forward + backward + optim)
 
-    if cfg.resume:
-        step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
-
+    if cfg.resume and accelerator.distributed_type.name != "DEEPSPEED":
+        step, optimizer, lr_scheduler = load_training_state(
+            cfg.checkpoint_path, optimizer, lr_scheduler
+        )
+    
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
@@ -430,6 +449,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+
+    if cfg.resume and accelerator.distributed_type.name == "DEEPSPEED":
+        import json
+
+        accelerator.load_state(str(cfg.checkpoint_path / "accelerate_state"))
+
+        with open(cfg.checkpoint_path / "training_step.json") as f:
+            step = json.load(f)["step"]
+
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -514,24 +542,57 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
-            if is_main_process:
-                logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                save_checkpoint(
-                    checkpoint_dir=checkpoint_dir,
-                    step=step,
-                    cfg=cfg,
-                    policy=accelerator.unwrap_model(policy),
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                )
-                update_last_checkpoint(checkpoint_dir)
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
+            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
 
-            accelerator.wait_for_everyone()
+            if accelerator.distributed_type.name == "DEEPSPEED":
+                if is_main_process:
+                    logging.info(f"Checkpoint policy after step {step}")
+
+                    # Save model/preprocessor/config only once.
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=accelerator.unwrap_model(policy),
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        accelerator=accelerator,
+                    )
+
+                accelerator.wait_for_everyone()
+
+                # Full DeepSpeed training state: all ranks must call this.
+                accelerator.save_state(str(checkpoint_dir / "accelerate_state"))
+
+                accelerator.wait_for_everyone()
+
+                if is_main_process:
+                    update_last_checkpoint(checkpoint_dir)
+                    if wandb_logger:
+                        wandb_logger.log_policy(checkpoint_dir)
+        
+            else:
+                if is_main_process:
+                    logging.info(f"Checkpoint policy after step {step}")
+                    checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=accelerator.unwrap_model(policy),
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        accelerator=accelerator,
+                    )
+                    update_last_checkpoint(checkpoint_dir)
+                    if wandb_logger:
+                        wandb_logger.log_policy(checkpoint_dir)
+
+                accelerator.wait_for_everyone()
 
         if cfg.env and is_eval_step:
             if is_main_process:

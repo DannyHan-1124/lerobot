@@ -7,6 +7,7 @@ export HF_HOME=$PROJECT_WS/hf_cache
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 export HF_HUB_CACHE=$HF_HOME/hub
 export TRANSFORMERS_CACHE=$HF_HOME/transformers
+# Set hf token
 
 # torch / cache
 export TORCH_HOME=$PROJECT_WS/torch_cache

@@ -1,17 +1,17 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH --gres=gpu:4
-#SBATCH --time=1:00:00
+#SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=10
-#SBATCH -J test_deepspeed
-#SBATCH -o logs/test_deepspeed/%x_%j.out
-#SBATCH -e logs/test_deepspeed/%x_%j.err
+#SBATCH -J pi05_pGbs16_20k_accumulation4_modified
+#SBATCH -o logs/pi05_pGbs16_20k_accumulation4_modified/%x_%j.out
+#SBATCH -e logs/pi05_pGbs16_20k_accumulation4_modified/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
 
-mkdir -p logs/test_deepspeed
+mkdir -p logs/pi05_pGbs16_20k_accumulation4_modified
 
 module purge
 module use /software/easybuild/modules/all
@@ -49,9 +49,9 @@ accelerate launch \
   --mixed_precision=bf16 \
   "$(which lerobot-train)" \
   --dataset.repo_id=/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_cube_full \
-  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/test \
+  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_pGbs16_20k_accumulation4_modified \
   --job_name=test \
-  --policy.path=lerobot/pi05_base \
+  --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
   --policy.repo_id=local/pi05-test \
   --policy.push_to_hub=false \
   --rename_map='{"observation.images.static_cam": "observation.images.base_0_rgb", "observation.images.wrist_cam": "observation.images.left_wrist_0_rgb"}' \
@@ -60,7 +60,8 @@ accelerate launch \
   --policy.device=cuda \
   --policy.gradient_checkpointing=true \
   --policy.optimizer_lr=1e-04 \
+  --save_freq=2500 \
   --gradient_accumulation_steps=4 \
-  --steps=10 \
+  --steps=20000 \
   --batch_size=16
 

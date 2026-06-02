@@ -36,7 +36,8 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.io_utils import load_json, write_json
 from lerobot.utils.random_utils import load_rng_state, save_rng_state
-
+import json
+import logging
 
 def get_step_identifier(step: int, total_steps: int) -> str:
     num_digits = max(6, len(str(total_steps)))
@@ -75,6 +76,7 @@ def save_checkpoint(
     scheduler: LRScheduler | None = None,
     preprocessor: PolicyProcessorPipeline | None = None,
     postprocessor: PolicyProcessorPipeline | None = None,
+    accelerator=None,
 ) -> None:
     """This function creates the following directory structure:
 
@@ -101,6 +103,11 @@ def save_checkpoint(
         preprocessor: The preprocessor/pipeline to save. Defaults to None.
         postprocessor: The postprocessor/pipeline to save. Defaults to None.
     """
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(checkpoint_dir / "training_step.json", "w") as f:
+        json.dump({"step": step}, f)
+    
     pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
     policy.save_pretrained(pretrained_dir)
     cfg.save_pretrained(pretrained_dir)
@@ -112,7 +119,12 @@ def save_checkpoint(
         preprocessor.save_pretrained(pretrained_dir)
     if postprocessor is not None:
         postprocessor.save_pretrained(pretrained_dir)
-    save_training_state(checkpoint_dir, step, optimizer, scheduler)
+    
+    if accelerator is not None and accelerator.distributed_type.name == "DEEPSPEED":
+        # accelerator.save_state(str(checkpoint_dir / "accelerate_state"))
+        logging.warning("Skipping normal LeRobot training_state save for DeepSpeed.")
+    else:
+        save_training_state(checkpoint_dir, step, optimizer, scheduler)
 
 
 def save_training_state(
