@@ -1,17 +1,17 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH --gres=gpu:4
-#SBATCH --time=1:00:00
+#SBATCH --time=8:00:00
 #SBATCH --cpus-per-task=10
-#SBATCH -J test_saving_training_state
-#SBATCH -o logs/test_saving_training_state/%x_%j.out
-#SBATCH -e logs/test_saving_training_state/%x_%j.err
+#SBATCH -J pi05_overfit_ep3_11
+#SBATCH -o logs/pi05_overfit_ep3_11/%x_%j.out
+#SBATCH -e logs/pi05_overfit_ep3_11/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
 
-mkdir -p logs/test_saving_training_state
+mkdir -p logs/pi05_overfit_ep3_11
 
 module purge
 module use /software/easybuild/modules/all
@@ -21,7 +21,7 @@ module load devel/cuda/12.9
 . ~/miniforge3/etc/profile.d/conda.sh
 conda activate lerobot
 
-source env_lerobot.sh
+source bash_scripts/env_lerobot.sh
 
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
 
@@ -49,10 +49,11 @@ accelerate launch \
   --mixed_precision=bf16 \
   "$(which lerobot-train)" \
   --dataset.repo_id=/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_cube_full \
-  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/test_saving_training_state \
-  --job_name=test \
+  --dataset.episodes='[3,11]' \
+  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_overfit_ep3_11 \
+  --job_name=pi05_overfit_ep3_11 \
   --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
-  --policy.repo_id=local/pi05-test \
+  --policy.repo_id=local/pi05-overfit-ep3-11 \
   --policy.push_to_hub=false \
   --rename_map='{"observation.images.static_cam": "observation.images.base_0_rgb", "observation.images.wrist_cam": "observation.images.left_wrist_0_rgb"}' \
   --policy.empty_cameras=1 \
@@ -60,8 +61,11 @@ accelerate launch \
   --policy.device=cuda \
   --policy.gradient_checkpointing=true \
   --policy.optimizer_lr=1e-04 \
-  --resume=true \
-  --gradient_accumulation_steps=4 \
-  --steps=20 \
-  --batch_size=8
-
+  --policy.scheduler_warmup_steps=100 \
+  --policy.scheduler_decay_steps=2000 \
+  --policy.scheduler_decay_lr=1e-06 \
+  --save_freq=500 \
+  --log_freq=20 \
+  --gradient_accumulation_steps=1 \
+  --steps=2000 \
+  --batch_size=4

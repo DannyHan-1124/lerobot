@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH --gres=gpu:1
-#SBATCH --time=1:00:00
+#SBATCH --time=2:00:00
 #SBATCH --cpus-per-task=10
 #SBATCH -J openloop_eval
 #SBATCH -o logs/openloop_eval/%x_%j.out
@@ -21,7 +21,7 @@ module load devel/cuda/12.9
 . ~/miniforge3/etc/profile.d/conda.sh
 conda activate lerobot
 
-source env_lerobot.sh
+source bash_scripts/env_lerobot.sh
 
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
 
@@ -42,4 +42,3 @@ if not torch.cuda.is_available():
 PY
 
 python /hkfs/work/workspace/scratch/utphd-myspace/lerobot/openloop_eval.py
-

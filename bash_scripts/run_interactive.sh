@@ -9,4 +9,5 @@ module load devel/cuda/12.9
 conda activate lerobot
 
 # Set up LeRobot environment
-source env_lerobot.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/env_lerobot.sh"

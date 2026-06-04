@@ -3,15 +3,15 @@
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=10
-#SBATCH -J pi05_pGbs16_20k_accumulation4_modified
-#SBATCH -o logs/pi05_pGbs16_20k_accumulation4_modified/%x_%j.out
-#SBATCH -e logs/pi05_pGbs16_20k_accumulation4_modified/%x_%j.err
+#SBATCH -J pi05_bs256_10ksteps
+#SBATCH -o logs/pi05_bs256_10ksteps/%x_%j.out
+#SBATCH -e logs/pi05_bs256_10ksteps/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
 
-mkdir -p logs/pi05_pGbs16_20k_accumulation4_modified
+mkdir -p logs/pi05_bs256_10ksteps
 
 module purge
 module use /software/easybuild/modules/all
@@ -21,7 +21,7 @@ module load devel/cuda/12.9
 . ~/miniforge3/etc/profile.d/conda.sh
 conda activate lerobot
 
-source env_lerobot.sh
+source bash_scripts/env_lerobot.sh
 
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
 
@@ -49,19 +49,20 @@ accelerate launch \
   --mixed_precision=bf16 \
   "$(which lerobot-train)" \
   --dataset.repo_id=/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_cube_full \
-  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_pGbs16_20k_accumulation4_modified \
+  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps \
   --job_name=test \
   --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
   --policy.repo_id=local/pi05-test \
   --policy.push_to_hub=false \
   --rename_map='{"observation.images.static_cam": "observation.images.base_0_rgb", "observation.images.wrist_cam": "observation.images.left_wrist_0_rgb"}' \
-  --policy.empty_cameras=1 \
   --policy.dtype=bfloat16 \
   --policy.device=cuda \
   --policy.gradient_checkpointing=true \
-  --policy.optimizer_lr=1e-04 \
+  --policy.optimizer_lr=5e-05 \
+  --policy.scheduler_warmup_steps=1000 \
+  --policy.scheduler_decay_steps=20000 \
+  --policy.scheduler_decay_lr=2.5e-06 \
   --save_freq=2500 \
   --gradient_accumulation_steps=4 \
-  --steps=20000 \
+  --steps=10000 \
   --batch_size=16
-

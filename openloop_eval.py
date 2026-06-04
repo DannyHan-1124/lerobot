@@ -81,11 +81,11 @@ def predict_one_sample(policy, preprocessor, postprocessor, sample, device):
 # Config
 # =========================
 
-ckpt_dir = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_pGbs16_20k_accumulation4_modified/checkpoints/last/pretrained_model"
+ckpt_dir = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps/checkpoints/last/pretrained_model"
 
-config_path = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_pGbs16_20k_accumulation4_modified/checkpoints/last/pretrained_model/train_config.json"
+config_path = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps/checkpoints/last/pretrained_model/train_config.json"
 
-plot_dir = "/hkfs/work/workspace/scratch/utphd-myspace/lerobot/openloop_eval/pi05_pGbs16_20k_accumulation4_modified"
+plot_dir = "/hkfs/work/workspace/scratch/utphd-myspace/lerobot/openloop_eval/pi05_bs256_10ksteps"
 os.makedirs(plot_dir, exist_ok=True)
 
 num_episodes_to_plot = 3
