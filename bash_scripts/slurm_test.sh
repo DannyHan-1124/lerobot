@@ -18,7 +18,7 @@ module use /software/easybuild/modules/all
 module load FFmpeg/7.1.2-GCCcore-14.3.0
 module load devel/cuda/12.9
 
-. ~/miniforge3/etc/profile.d/conda.sh
+. /hkfs/work/workspace/scratch/utphd-myspace/miniforge3/etc/profile.d/conda.sh
 conda activate lerobot
 
 source bash_scripts/env_lerobot.sh

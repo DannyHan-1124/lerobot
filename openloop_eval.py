@@ -81,14 +81,14 @@ def predict_one_sample(policy, preprocessor, postprocessor, sample, device):
 # Config
 # =========================
 
-ckpt_dir = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps/checkpoints/last/pretrained_model"
+ckpt_dir = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps_fixed_index/checkpoints/last/pretrained_model"
 
-config_path = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps/checkpoints/last/pretrained_model/train_config.json"
+config_path = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps_fixed_index/checkpoints/last/pretrained_model/train_config.json"
 
-plot_dir = "/hkfs/work/workspace/scratch/utphd-myspace/lerobot/openloop_eval/pi05_bs256_10ksteps"
+plot_dir = "/hkfs/work/workspace/scratch/utphd-myspace/lerobot/openloop_eval/pi05_bs256_10ksteps_fixed_index"
 os.makedirs(plot_dir, exist_ok=True)
 
-num_episodes_to_plot = 3
+num_episodes_to_plot = 5
 random_seed = 42
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
