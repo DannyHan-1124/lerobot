@@ -64,6 +64,11 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    delay: int | Tensor | None
+    action_prefix: Tensor | None
+    infer_time_schedule: str | None
+    alpha: float | None
+    u0: float | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -86,8 +91,8 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError("The time tensor is expected to be of shape `(batch_size,)` or `(batch_size, horizon)`.")
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
@@ -95,8 +100,8 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    sin_input = time.to(dtype=dtype)[..., None] * scaling_factor
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
 def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
@@ -650,6 +655,47 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
+    def compute_HAS(
+        self,
+        time: Tensor,
+        delay: Tensor | None = None,
+        alpha: float | None = None,
+        u0: float | None = None,
+    ) -> Tensor:
+        """Compute FASTER's Horizon-Aware Schedule for per-action denoising times."""
+        if alpha is None:
+            alpha = self.config.faster_alpha
+        if u0 is None:
+            u0 = self.config.faster_u0
+        if not 0.0 <= float(alpha):
+            raise ValueError(f"alpha must be non-negative, got {alpha}")
+        if not 0.0 <= float(u0) <= 1.0:
+            raise ValueError(f"u0 must be in [0, 1], got {u0}")
+
+        if time.ndim == 1:
+            time = time[:, None]
+        if time.ndim == 2:
+            time = time[:, :, None]
+        if time.ndim != 3:
+            raise ValueError(f"Expected time shape (steps, batch, 1), got {tuple(time.shape)}")
+
+        _, bsize, _ = time.shape
+        device = time.device
+        dtype = time.dtype
+        if delay is None:
+            delay = torch.zeros(bsize, dtype=torch.long, device=device)
+        delay = delay.to(device=device, dtype=torch.long).reshape(bsize)
+        delay = torch.clamp(delay, min=0, max=self.config.chunk_size - 1)
+
+        horizon_idx = torch.arange(self.config.chunk_size, dtype=dtype, device=device)[None, :]
+        delay_f = delay.to(dtype=dtype)[:, None]
+        valid_idx = torch.clamp(horizon_idx - delay_f, min=0.0)
+        denom = torch.clamp((self.config.chunk_size - 1) - delay_f, min=1.0)
+        horizon_fraction = valid_idx / denom
+        schedule_offset = (1.0 - horizon_fraction.pow(float(alpha))) * float(u0)
+        scheduled = (time - schedule_offset[None, :, :]) / (1.0 - schedule_offset[None, :, :])
+        return torch.clamp(scheduled, min=0.0, max=1.0)
+
     def embed_prefix(
         self, images, img_masks, tokens, masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -820,6 +866,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         bsize = tokens.shape[0]
         device = tokens.device
+        infer_time_schedule = kwargs.get("infer_time_schedule") or self.config.infer_time_schedule
+        alpha = kwargs.get("alpha")
+        u0 = kwargs.get("u0")
+        delay = kwargs.get("delay")
+        if delay is None:
+            delay_t = torch.zeros(bsize, dtype=torch.long, device=device)
+        elif isinstance(delay, Tensor):
+            delay_t = delay.to(device=device, dtype=torch.long).reshape(bsize)
+        else:
+            delay_t = torch.full((bsize,), int(delay), dtype=torch.long, device=device)
+        delay_t = torch.clamp(delay_t, min=0, max=self.config.chunk_size - 1)
 
         if noise is None:
             # Sample noise with padded dimension as expected by action_in_proj
@@ -829,6 +886,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 self.config.max_action_dim,
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
+        action_prefix = kwargs.get("action_prefix")
+        if action_prefix is None:
+            action_prefix = torch.zeros_like(noise)
+        else:
+            action_prefix = action_prefix.to(device=device, dtype=noise.dtype)
+            action_prefix = pad_vector(action_prefix, self.config.max_action_dim)
+            if action_prefix.shape != noise.shape:
+                raise ValueError(
+                    f"action_prefix shape {tuple(action_prefix.shape)} does not match noise shape {tuple(noise.shape)}"
+                )
+
+        prefix_action_mask = torch.arange(self.config.chunk_size, device=device)[None, :] < delay_t[:, None]
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -845,12 +914,36 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_cache=True,
         )
 
-        dt = -1.0 / num_steps
-
         x_t = noise
-        for step in range(num_steps):
-            time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+        if infer_time_schedule == "HAS":
+            base_times = torch.linspace(1.0, 0.0, int(num_steps) + 1, dtype=torch.float32, device=device)
+            t_schedule = self.compute_HAS(
+                base_times[:, None, None].expand(-1, bsize, 1),
+                delay=delay_t,
+                alpha=alpha,
+                u0=u0,
+            )
+            t_schedule = torch.where(prefix_action_mask[None, :, :], torch.zeros_like(t_schedule), t_schedule)
+            t_starts = t_schedule[:-1]
+            dt_schedule = t_schedule[1:] - t_schedule[:-1]
+        elif infer_time_schedule == "const":
+            dt = -1.0 / int(num_steps)
+            t_starts = torch.stack(
+                [
+                    torch.full((bsize, self.config.chunk_size), 1.0 + step * dt, dtype=torch.float32, device=device)
+                    for step in range(int(num_steps))
+                ],
+                dim=0,
+            )
+            dt_schedule = torch.full_like(t_starts, dt)
+            t_starts = torch.where(prefix_action_mask[None, :, :], torch.zeros_like(t_starts), t_starts)
+        else:
+            raise ValueError(f"Invalid infer_time_schedule: {infer_time_schedule!r}")
+
+        for step in range(int(num_steps)):
+            x_t = torch.where(prefix_action_mask[..., None], action_prefix, x_t)
+            time_tensor = t_starts[step]
+            dt_tensor = dt_schedule[step]
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -869,19 +962,116 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     x_t=x_t,
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
-                    time=time,
+                    time=float(time_tensor.max().item()),
                     original_denoise_step_partial=denoise_step_partial_call,
                     execution_horizon=execution_horizon,
                 )
             else:
                 v_t = denoise_step_partial_call(x_t)
 
-            x_t = x_t + dt * v_t
+            x_t = x_t + dt_tensor[..., None].to(dtype=v_t.dtype) * v_t
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+                self.rtc_processor.track(time=float(time_tensor.max().item()), x_t=x_t, v_t=v_t)
 
         return x_t
+
+    @torch.no_grad()
+    def sample_actions_streaming(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        noise=None,
+        num_steps=None,
+        ready_threshold: float = 0.01,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ):
+        """Yield newly ready action indices during FASTER/HAS denoising."""
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+
+        bsize = tokens.shape[0]
+        device = tokens.device
+        alpha = kwargs.get("alpha")
+        u0 = kwargs.get("u0")
+        delay = kwargs.get("delay")
+        if delay is None:
+            delay_t = torch.zeros(bsize, dtype=torch.long, device=device)
+        elif isinstance(delay, Tensor):
+            delay_t = delay.to(device=device, dtype=torch.long).reshape(bsize)
+        else:
+            delay_t = torch.full((bsize,), int(delay), dtype=torch.long, device=device)
+        delay_t = torch.clamp(delay_t, min=0, max=self.config.chunk_size - 1)
+
+        if noise is None:
+            noise = self.sample_noise(
+                (bsize, self.config.chunk_size, self.config.max_action_dim),
+                device,
+            )
+        action_prefix = kwargs.get("action_prefix")
+        if action_prefix is None:
+            action_prefix = torch.zeros_like(noise)
+        else:
+            action_prefix = action_prefix.to(device=device, dtype=noise.dtype)
+            action_prefix = pad_vector(action_prefix, self.config.max_action_dim)
+            if action_prefix.shape != noise.shape:
+                raise ValueError(
+                    f"action_prefix shape {tuple(action_prefix.shape)} does not match noise shape {tuple(noise.shape)}"
+                )
+
+        prefix_action_mask = torch.arange(self.config.chunk_size, device=device)[None, :] < delay_t[:, None]
+        already_ready = prefix_action_mask.clone()
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        base_times = torch.linspace(1.0, 0.0, int(num_steps) + 1, dtype=torch.float32, device=device)
+        t_schedule = self.compute_HAS(
+            base_times[:, None, None].expand(-1, bsize, 1),
+            delay=delay_t,
+            alpha=alpha,
+            u0=u0,
+        )
+        t_schedule = torch.where(prefix_action_mask[None, :, :], torch.zeros_like(t_schedule), t_schedule)
+        t_starts = t_schedule[:-1]
+        dt_schedule = t_schedule[1:] - t_schedule[:-1]
+        ready_schedule = t_schedule[1:] <= float(ready_threshold)
+
+        x_t = noise
+        for step in range(int(num_steps)):
+            x_t = torch.where(prefix_action_mask[..., None], action_prefix, x_t)
+            time_tensor = t_starts[step]
+            dt_tensor = dt_schedule[step]
+            v_t = self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=x_t,
+                timestep=time_tensor,
+            )
+            x_t = x_t + dt_tensor[..., None].to(dtype=v_t.dtype) * v_t
+
+            newly_ready = ready_schedule[step] & ~already_ready
+            already_ready = already_ready | ready_schedule[step]
+            if torch.any(newly_ready):
+                yield newly_ready, x_t
+
+        final_ready = ~already_ready
+        if torch.any(final_ready):
+            yield final_ready, x_t
 
     def denoise_step(
         self,
@@ -1284,6 +1474,21 @@ class PI05Policy(PreTrainedPolicy):
         actions = actions[:, :, :original_action_dim]
 
         return actions
+
+    @torch.no_grad()
+    def predict_action_stream(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]):
+        """Yield newly ready action indices and chunks during FASTER/HAS inference."""
+        self.eval()
+
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        original_action_dim = self.config.output_features[ACTION].shape[0]
+
+        for newly_ready, actions in self.model.sample_actions_streaming(
+            images, img_masks, tokens, masks, **kwargs
+        ):
+            actions = actions[:, :, :original_action_dim]
+            yield newly_ready, actions
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.

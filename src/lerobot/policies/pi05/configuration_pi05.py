@@ -48,6 +48,9 @@ class PI05Config(PreTrainedConfig):
     time_sampling_offset: float = 0.001
     min_period: float = 4e-3
     max_period: float = 4.0
+    infer_time_schedule: str = "const"  # Options: "const", "HAS"
+    faster_alpha: float = 1.0
+    faster_u0: float = 0.9
 
     # Relative actions: converts absolute actions to relative (relative to state).
     use_relative_actions: bool = False
