@@ -1480,6 +1480,17 @@ class PI05Policy(PreTrainedPolicy):
         """Yield newly ready action indices and chunks during FASTER/HAS inference."""
         self.eval()
 
+        infer_time_schedule = kwargs.get("infer_time_schedule") or self.config.infer_time_schedule
+        if infer_time_schedule == "const":
+            actions = self.predict_action_chunk(batch, **kwargs)
+            newly_ready = torch.ones(
+                actions.shape[:2],
+                dtype=torch.bool,
+                device=actions.device,
+            )
+            yield newly_ready, actions
+            return
+
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         original_action_dim = self.config.output_features[ACTION].shape[0]
