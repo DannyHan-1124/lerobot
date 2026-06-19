@@ -69,6 +69,7 @@ class ActionSelectKwargs(TypedDict, total=False):
     infer_time_schedule: str | None
     alpha: float | None
     u0: float | None
+    early_stop_actions: int | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -992,6 +993,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
+        early_stop_actions = kwargs.get("early_stop_actions")
+        if early_stop_actions is not None:
+            early_stop_actions = int(early_stop_actions)
+            if early_stop_actions <= 0:
+                early_stop_actions = None
+
         bsize = tokens.shape[0]
         device = tokens.device
         alpha = kwargs.get("alpha")
@@ -1052,6 +1059,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         ready_schedule = t_schedule[1:] <= float(ready_threshold)
 
         x_t = noise
+        emitted_action_count = 0
         for step in range(int(num_steps)):
             x_t = torch.where(prefix_action_mask[..., None], action_prefix, x_t)
             time_tensor = t_starts[step]
@@ -1066,8 +1074,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             newly_ready = ready_schedule[step] & ~already_ready
             already_ready = already_ready | ready_schedule[step]
+            if early_stop_actions is not None and torch.any(newly_ready):
+                if bsize != 1:
+                    raise ValueError("early_stop_actions currently requires batch size 1")
+                remaining = early_stop_actions - emitted_action_count
+                ready_indices = torch.nonzero(newly_ready[0], as_tuple=False).flatten()
+                if ready_indices.numel() > remaining:
+                    selected_ready = torch.zeros_like(newly_ready)
+                    selected_ready[0, ready_indices[:remaining]] = True
+                    newly_ready = selected_ready
+                emitted_action_count += int(torch.count_nonzero(newly_ready).item())
             if torch.any(newly_ready):
                 yield newly_ready, x_t
+            if early_stop_actions is not None and emitted_action_count >= early_stop_actions:
+                return
 
         final_ready = ~already_ready
         if torch.any(final_ready):
