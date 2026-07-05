@@ -17,6 +17,7 @@
 import builtins
 import logging
 import math
+import time
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
@@ -573,6 +574,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
+        self.last_stream_profile: dict[str, float | int] = {}
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -673,14 +675,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if not 0.0 <= float(u0) <= 1.0:
             raise ValueError(f"u0 must be in [0, 1], got {u0}")
 
-        if time.ndim == 1:
-            time = time[:, None]
-        if time.ndim == 2:
-            time = time[:, :, None]
-        if time.ndim != 3:
-            raise ValueError(f"Expected time shape (steps, batch, 1), got {tuple(time.shape)}")
+        if time.ndim not in (1, 2, 3):
+            raise ValueError(
+                f"Expected time shape (batch,), (batch, horizon), or (steps, batch, horizon), "
+                f"got {tuple(time.shape)}"
+            )
 
-        _, bsize, _ = time.shape
+        bsize = time.shape[0] if time.ndim in (1, 2) else time.shape[1]
         device = time.device
         dtype = time.dtype
         if delay is None:
@@ -694,8 +695,62 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         denom = torch.clamp((self.config.chunk_size - 1) - delay_f, min=1.0)
         horizon_fraction = valid_idx / denom
         schedule_offset = (1.0 - horizon_fraction.pow(float(alpha))) * float(u0)
+
+        if time.ndim == 1:
+            time = time[:, None]
+
+        if time.ndim == 2:
+            if time.shape[1] == 1:
+                time = time.expand(-1, self.config.chunk_size)
+            elif time.shape[1] != self.config.chunk_size:
+                raise ValueError(
+                    f"Expected time shape (batch, 1) or (batch, {self.config.chunk_size}), "
+                    f"got {tuple(time.shape)}"
+                )
+            scheduled = (time - schedule_offset) / (1.0 - schedule_offset)
+            return torch.clamp(scheduled, min=0.0, max=1.0)
+
+        if time.shape[2] == 1:
+            time = time.expand(-1, -1, self.config.chunk_size)
+        elif time.shape[2] != self.config.chunk_size:
+            raise ValueError(
+                f"Expected time shape (steps, batch, 1) or (steps, batch, {self.config.chunk_size}), "
+                f"got {tuple(time.shape)}"
+            )
         scheduled = (time - schedule_offset[None, :, :]) / (1.0 - schedule_offset[None, :, :])
         return torch.clamp(scheduled, min=0.0, max=1.0)
+
+    def sample_training_time_and_mask(self, actions: Tensor) -> tuple[Tensor, Tensor]:
+        """Sample FASTER training action-conditioning and mixed const/HAS time schedule."""
+        bsize, horizon = actions.shape[:2]
+        if horizon != self.config.chunk_size:
+            raise ValueError(f"Expected action horizon {self.config.chunk_size}, got {horizon}")
+
+        device = actions.device
+        max_delay = min(int(self.config.faster_train_max_delay), self.config.chunk_size)
+        if max_delay > 0:
+            delay = torch.randint(0, max_delay, (bsize,), device=device)
+        else:
+            delay = torch.zeros(bsize, dtype=torch.long, device=device)
+
+        prefix_action_mask = torch.arange(self.config.chunk_size, device=device)[None, :] < delay[:, None]
+
+        time_const = self.sample_time(bsize, device)[:, None].expand(-1, self.config.chunk_size)
+        time_has = self.compute_HAS(
+            time_const,
+            delay,
+            alpha=self.config.faster_train_alpha,
+            u0=self.config.faster_train_u0,
+        )
+
+        use_has = torch.rand((bsize, 1), device=device) < float(self.config.faster_train_mix_prob)
+        time = torch.where(use_has, time_has, time_const)
+
+        # Prefix positions are clean ground-truth actions, so the model sees them at t=0 and is
+        # supervised only on the remaining postfix actions.
+        time = torch.where(prefix_action_mask, torch.zeros_like(time), time)
+        action_loss_mask = ~prefix_action_mask
+        return time.to(dtype=torch.float32, device=device), action_loss_mask
 
     def embed_prefix(
         self, images, img_masks, tokens, masks
@@ -796,8 +851,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         actions = actions.to(dtype=model_dtype)
         noise = noise.to(dtype=model_dtype)
         time = time.to(dtype=model_dtype)
-        
-        time_expanded = time[:, None, None]
+
+        if time.ndim == 1:
+            time_expanded = time[:, None, None]
+        elif time.ndim == 2:
+            if time.shape[1] != actions.shape[1]:
+                raise ValueError(
+                    f"Per-action time shape {tuple(time.shape)} does not match actions {tuple(actions.shape)}"
+                )
+            time_expanded = time[:, :, None]
+        else:
+            raise ValueError(f"Expected training time shape (batch,) or (batch, horizon), got {tuple(time.shape)}")
+
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
@@ -990,6 +1055,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         **kwargs: Unpack[ActionSelectKwargs],
     ):
         """Yield newly ready action indices during FASTER/HAS denoising."""
+        profile_start = time.perf_counter()
+        self.last_stream_profile = {
+            "prefix_embed_s": 0.0,
+            "prefix_forward_s": 0.0,
+            "schedule_s": 0.0,
+            "denoise_s": 0.0,
+            "total_s": 0.0,
+            "denoise_steps": 0,
+            "yield_count": 0,
+            "emitted_action_count": 0,
+        }
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -1031,13 +1107,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_action_mask = torch.arange(self.config.chunk_size, device=device)[None, :] < delay_t[:, None]
         already_ready = prefix_action_mask.clone()
 
+        prefix_embed_start = time.perf_counter()
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        self.last_stream_profile["prefix_embed_s"] = time.perf_counter() - prefix_embed_start
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        prefix_forward_start = time.perf_counter()
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -1045,7 +1124,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        self.last_stream_profile["prefix_forward_s"] = time.perf_counter() - prefix_forward_start
 
+        schedule_start = time.perf_counter()
         base_times = torch.linspace(1.0, 0.0, int(num_steps) + 1, dtype=torch.float32, device=device)
         t_schedule = self.compute_HAS(
             base_times[:, None, None].expand(-1, bsize, 1),
@@ -1057,6 +1138,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         t_starts = t_schedule[:-1]
         dt_schedule = t_schedule[1:] - t_schedule[:-1]
         ready_schedule = t_schedule[1:] <= float(ready_threshold)
+        self.last_stream_profile["schedule_s"] = time.perf_counter() - schedule_start
 
         x_t = noise
         emitted_action_count = 0
@@ -1064,12 +1146,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             x_t = torch.where(prefix_action_mask[..., None], action_prefix, x_t)
             time_tensor = t_starts[step]
             dt_tensor = dt_schedule[step]
+            denoise_start = time.perf_counter()
             v_t = self.denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 x_t=x_t,
                 timestep=time_tensor,
             )
+            self.last_stream_profile["denoise_s"] += time.perf_counter() - denoise_start
+            self.last_stream_profile["denoise_steps"] = int(step) + 1
             x_t = x_t + dt_tensor[..., None].to(dtype=v_t.dtype) * v_t
 
             newly_ready = ready_schedule[step] & ~already_ready
@@ -1083,15 +1168,25 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     selected_ready = torch.zeros_like(newly_ready)
                     selected_ready[0, ready_indices[:remaining]] = True
                     newly_ready = selected_ready
-                emitted_action_count += int(torch.count_nonzero(newly_ready).item())
             if torch.any(newly_ready):
+                emitted_action_count += int(torch.count_nonzero(newly_ready).item())
+                self.last_stream_profile["emitted_action_count"] = emitted_action_count
+                self.last_stream_profile["yield_count"] += 1
+                self.last_stream_profile["total_s"] = time.perf_counter() - profile_start
                 yield newly_ready, x_t
             if early_stop_actions is not None and emitted_action_count >= early_stop_actions:
+                self.last_stream_profile["total_s"] = time.perf_counter() - profile_start
                 return
 
         final_ready = ~already_ready
         if torch.any(final_ready):
+            final_action_count = int(torch.count_nonzero(final_ready).item())
+            emitted_action_count += final_action_count
+            self.last_stream_profile["yield_count"] += 1
+            self.last_stream_profile["emitted_action_count"] = emitted_action_count
+            self.last_stream_profile["total_s"] = time.perf_counter() - profile_start
             yield final_ready, x_t
+        self.last_stream_profile["total_s"] = time.perf_counter() - profile_start
 
     def denoise_step(
         self,
@@ -1502,7 +1597,18 @@ class PI05Policy(PreTrainedPolicy):
 
         infer_time_schedule = kwargs.get("infer_time_schedule") or self.config.infer_time_schedule
         if infer_time_schedule == "const":
+            profile_start = time.perf_counter()
             actions = self.predict_action_chunk(batch, **kwargs)
+            self.model.last_stream_profile = {
+                "prefix_embed_s": 0.0,
+                "prefix_forward_s": 0.0,
+                "schedule_s": 0.0,
+                "denoise_s": time.perf_counter() - profile_start,
+                "total_s": time.perf_counter() - profile_start,
+                "denoise_steps": int(self.config.num_inference_steps),
+                "yield_count": 1,
+                "emitted_action_count": int(actions.shape[1]),
+            }
             newly_ready = torch.ones(
                 actions.shape[:2],
                 dtype=torch.bool,
@@ -1537,27 +1643,35 @@ class PI05Policy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         noise = self.model.sample_noise(actions.shape, actions.device)
-        time = self.model.sample_time(actions.shape[0], actions.device)
+        time, action_loss_mask = self.model.sample_training_time_and_mask(actions)
 
-        # Compute loss (no separate state needed for PI05)
+        # Compute loss (no separate state needed for PI05). FASTER action-conditioning
+        # sets some prefix actions to clean targets and masks them out of supervision.
         losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
+        loss_mask = action_loss_mask[:, :, None].to(device=losses.device, dtype=losses.dtype)
+        valid_loss_count = loss_mask.sum().clamp_min(1.0)
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().float().cpu().numpy().tolist(),
+            "loss_per_dim": (
+                (losses * loss_mask).sum(dim=[0, 1]) / valid_loss_count
+            ).detach().float().cpu().numpy().tolist(),
+            "faster_train_prefix_actions": (~action_loss_mask).float().sum(dim=1).mean().item(),
+            "faster_train_has_fraction": float(self.config.faster_train_mix_prob),
         }
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_count = loss_mask.sum(dim=(1, 2)).clamp_min(1.0) * losses.shape[-1]
+            per_sample_loss = (losses * loss_mask).sum(dim=(1, 2)) / per_sample_count
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = (losses * loss_mask).sum() / (valid_loss_count * losses.shape[-1])
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

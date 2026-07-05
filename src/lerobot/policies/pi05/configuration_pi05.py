@@ -52,6 +52,13 @@ class PI05Config(PreTrainedConfig):
     faster_alpha: float = 1.0
     faster_u0: float = 0.9
 
+    # FASTER training settings. These mirror the official FASTER training recipe:
+    # randomly condition on a clean action prefix and mix const/HAS flow times.
+    faster_train_max_delay: int = 10
+    faster_train_mix_prob: float = 0.5
+    faster_train_alpha: float = 0.6
+    faster_train_u0: float = 0.9
+
     # Relative actions: converts absolute actions to relative (relative to state).
     use_relative_actions: bool = False
     # Joint names to exclude from relative (kept absolute). Empty list = all dims relative.
@@ -123,6 +130,22 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.faster_train_max_delay < 0:
+            raise ValueError(
+                f"faster_train_max_delay must be non-negative, got {self.faster_train_max_delay}"
+            )
+
+        if not 0.0 <= self.faster_train_mix_prob <= 1.0:
+            raise ValueError(
+                f"faster_train_mix_prob must be in [0, 1], got {self.faster_train_mix_prob}"
+            )
+
+        if not 0.0 <= self.faster_train_alpha <= 1.0:
+            raise ValueError(f"faster_train_alpha must be in [0, 1], got {self.faster_train_alpha}")
+
+        if not 0.0 <= self.faster_train_u0 <= 1.0:
+            raise ValueError(f"faster_train_u0 must be in [0, 1], got {self.faster_train_u0}")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
