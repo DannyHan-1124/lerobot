@@ -20,7 +20,6 @@ from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTr
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
-from ..rtc.configuration_rtc import RTCConfig
 
 DEFAULT_IMAGE_SIZE = 224
 
@@ -35,6 +34,14 @@ class PI05Config(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
+
+    abpolicy_enabled: bool = False
+    abpolicy_past_action_steps: int = 8
+    abpolicy_future_action_steps: int = 32
+    abpolicy_spline_degree: int = 3
+    abpolicy_num_control_points: int = 8
+    abpolicy_num_free_control_points: int = 4
+    abpolicy_action_representation: str = "cartesian_rotvec"
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -55,9 +62,6 @@ class PI05Config(PreTrainedConfig):
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
     # Populated at runtime from dataset metadata by make_policy.
     action_feature_names: list[str] | None = None
-
-    # Real-Time Chunking (RTC) configuration
-    rtc_config: RTCConfig | None = None
 
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
@@ -107,10 +111,26 @@ class PI05Config(PreTrainedConfig):
         super().__post_init__()
 
         # Validate configuration
-        if self.n_action_steps > self.chunk_size:
+        action_horizon = self.abpolicy_future_action_steps if self.abpolicy_enabled else self.chunk_size
+        if self.n_action_steps > action_horizon:
             raise ValueError(
-                f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
+                f"n_action_steps ({self.n_action_steps}) cannot be greater than action horizon ({action_horizon})"
             )
+
+        if self.abpolicy_enabled:
+            if self.chunk_size != self.abpolicy_num_control_points:
+                raise ValueError("ABPolicy requires chunk_size == abpolicy_num_control_points")
+            if self.abpolicy_num_control_points <= self.abpolicy_spline_degree:
+                raise ValueError("ABPolicy needs more control points than the spline degree")
+            if not 0 < self.abpolicy_num_free_control_points <= self.abpolicy_num_control_points:
+                raise ValueError("invalid abpolicy_num_free_control_points")
+            if self.use_relative_actions:
+                raise ValueError("ABPolicy control points require absolute actions")
+            if self.abpolicy_action_representation != "cartesian_rotvec":
+                raise ValueError("ABPolicy currently supports cartesian_rotvec actions")
+            # Quaternion statistics are not valid after mapping orientations to
+            # request-local rotation vectors, so keep these targets unnormalized.
+            self.normalization_mapping["ACTION"] = NormalizationMode.IDENTITY
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
@@ -168,6 +188,8 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
+        if self.abpolicy_enabled:
+            return list(range(-self.abpolicy_past_action_steps, self.abpolicy_future_action_steps))
         return list(range(self.chunk_size))
 
     @property

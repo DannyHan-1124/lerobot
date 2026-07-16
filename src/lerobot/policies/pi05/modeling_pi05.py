@@ -56,14 +56,17 @@ from lerobot.utils.constants import (
 )
 
 from ..pretrained import PreTrainedPolicy, T
-from ..rtc.modeling_rtc import RTCProcessor
+from .bspline import (
+    bspline_basis,
+    cartesian_quaternion_to_local_rotvec,
+    fit_control_points,
+    rebuild_trajectory,
+)
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 
 
 class ActionSelectKwargs(TypedDict, total=False):
-    inference_delay: int | None
-    prev_chunk_left_over: Tensor | None
-    execution_horizon: int | None
+    num_steps: int | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -563,10 +566,9 @@ class PaliGemmaWithExpertModel(
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI05 PyTorch model."""
 
-    def __init__(self, config: PI05Config, rtc_processor: RTCProcessor | None = None):
+    def __init__(self, config: PI05Config):
         super().__init__()
         self.config = config
-        self.rtc_processor = rtc_processor
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -617,9 +619,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
-
-    def _rtc_enabled(self):
-        return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -860,26 +859,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     timestep=current_timestep,
                 )
 
-            if self._rtc_enabled():
-                inference_delay = kwargs.get("inference_delay")
-                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
-                execution_horizon = kwargs.get("execution_horizon")
-
-                v_t = self.rtc_processor.denoise_step(
-                    x_t=x_t,
-                    prev_chunk_left_over=prev_chunk_left_over,
-                    inference_delay=inference_delay,
-                    time=time,
-                    original_denoise_step_partial=denoise_step_partial_call,
-                    execution_horizon=execution_horizon,
-                )
-            else:
-                v_t = denoise_step_partial_call(x_t)
+            v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
-
-            if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
         return x_t
 
@@ -944,8 +926,7 @@ class PI05Policy(PreTrainedPolicy):
         self.config = config
 
         # Initialize the core PI05 model
-        self.init_rtc_processor()
-        self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+        self.model = PI05Pytorch(config)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1154,22 +1135,6 @@ class PI05Policy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
 
-    def init_rtc_processor(self):
-        """Initialize RTC processor if RTC is enabled in config."""
-        self.rtc_processor = None
-
-        # Create processor if config provided
-        # If RTC is not enabled - we can still track the denoising data
-        if self.config.rtc_config is not None:
-            self.rtc_processor = RTCProcessor(self.config.rtc_config)
-
-            model_value = getattr(self, "model", None)
-            if model_value is not None:
-                model_value.rtc_processor = self.rtc_processor
-
-    def _rtc_enabled(self) -> bool:
-        return self.config.rtc_config is not None and self.config.rtc_config.enabled
-
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
@@ -1247,16 +1212,25 @@ class PI05Policy(PreTrainedPolicy):
 
     def prepare_action(self, batch):
         """Pad action"""
-        actions = pad_vector(batch[ACTION], self.config.max_action_dim)
+        actions = batch[ACTION]
+        if self.config.abpolicy_enabled:
+            actions = cartesian_quaternion_to_local_rotvec(
+                actions, self.config.abpolicy_past_action_steps
+            )
+            basis = bspline_basis(
+                self.config.abpolicy_past_action_steps + self.config.abpolicy_future_action_steps,
+                self.config.abpolicy_num_control_points,
+                self.config.abpolicy_spline_degree,
+                device=actions.device,
+                dtype=actions.dtype,
+            )
+            actions = fit_control_points(actions, basis)
+        actions = pad_vector(actions, self.config.max_action_dim)
         return actions
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
-        assert not self._rtc_enabled(), (
-            "RTC is not supported for select_action, use it with predict_action_chunk"
-        )
-
         self.eval()
 
         # Action queue logic for n_action_steps > 1
@@ -1276,14 +1250,41 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
+        # Sample B-spline control points (or raw actions when ABPolicy is disabled).
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
 
+        if self.config.abpolicy_enabled:
+            if self.config.abpolicy_action_representation == "cartesian_rotvec":
+                raise RuntimeError(
+                    "Cartesian ABPolicy needs the request reference quaternion; "
+                    "use predict_control_points and reconstruct in the robot client"
+                )
+            basis = bspline_basis(
+                self.config.abpolicy_past_action_steps + self.config.abpolicy_future_action_steps,
+                self.config.abpolicy_num_control_points,
+                self.config.abpolicy_spline_degree,
+                device=actions.device,
+                dtype=actions.dtype,
+            )
+            actions = rebuild_trajectory(actions, basis)[:, self.config.abpolicy_past_action_steps :]
+
         return actions
+
+    @torch.no_grad()
+    def predict_control_points(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+        """Predict ABPolicy control points without reconstructing the trajectory."""
+        if not self.config.abpolicy_enabled:
+            raise RuntimeError("predict_control_points requires abpolicy_enabled")
+        self.eval()
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        control_points = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        action_dim = self.config.output_features[ACTION].shape[0]
+        return control_points[:, :, :action_dim]
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.

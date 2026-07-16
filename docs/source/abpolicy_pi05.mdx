@@ -1,0 +1,22 @@
+# ABPolicy with PI0.5
+
+This implementation applies ABPolicy's action representation and deployment
+algorithm to the existing PI0.5 flow-matching policy.
+
+When `policy.abpolicy_enabled=true`, the dataset samples the bidirectional
+window `[-8, ..., 31]`. Each 40-step absolute Cartesian trajectory is mapped
+from `[xyz, quaternion_xyzw, gripper]` to
+`[xyz, request-local rotation vector, gripper]`, then fit to eight continuous
+cubic B-spline control points. PI0.5 is trained with its normal flow-matching
+loss on those control points.
+
+Use `bash_scripts/slurm_scripts.sh` to train. The input dataset must contain
+absolute Cartesian pose plus gripper as its eight action dimensions. Action
+normalization is intentionally disabled because marginal quaternion statistics
+are not meaningful after conversion to local rotation vectors; observation
+normalization is unchanged.
+
+The checkpoint stores all spline parameters. `predict_control_points()` returns
+the eight points used by asynchronous robot deployment. The policy node sends
+the measured end-effector quaternion with each result, and the Franka client
+uses it to refit executed history and reconstruct unit-quaternion commands.
