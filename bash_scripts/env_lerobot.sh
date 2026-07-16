@@ -1,6 +1,7 @@
 #!/bin/bash
 
 export PROJECT_WS=/hkfs/work/workspace/scratch/utphd-myspace
+export PYTHONPATH=$PROJECT_WS/lerobot/src:${PYTHONPATH:-}
 
 # HF
 export HF_HOME=$PROJECT_WS/hf_cache
@@ -9,6 +10,7 @@ export HF_HUB_CACHE=$HF_HOME/hub
 export TRANSFORMERS_CACHE=$HF_HOME/transformers
 
 # Set hf token
+
 
 # torch / cache
 export TORCH_HOME=$PROJECT_WS/torch_cache
