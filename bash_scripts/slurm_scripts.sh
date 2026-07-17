@@ -4,13 +4,14 @@
 #SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=10
 #SBATCH -J pi05_abpolicy
-#SBATCH -o logs/pi05_abpolicy/%x_%j.out
-#SBATCH -e logs/pi05_abpolicy/%x_%j.err
+#SBATCH -o logs/pi05_cylinder_full_abpolicy_10ksteps/%x_%j.out
+#SBATCH -e logs/pi05_cylinder_full_abpolicy_10ksteps/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
-mkdir -p logs/pi05_abpolicy
+mkdir -p logs/pi05_cylinder_full_abpolicy_10ksteps
+export PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}"
 
 module purge
 module use /software/easybuild/modules/all
@@ -21,6 +22,21 @@ module load devel/cuda/12.9
 conda activate lerobot
 source bash_scripts/env_lerobot.sh
 
+python - <<'PY'
+from pathlib import Path
+
+import lerobot
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+expected_source = (Path.cwd() / "src").resolve()
+loaded_source = Path(lerobot.__file__).resolve()
+print(f"Using LeRobot from: {loaded_source}")
+if not loaded_source.is_relative_to(expected_source):
+    raise RuntimeError(f"Expected LeRobot under {expected_source}, loaded {loaded_source}")
+if not hasattr(PI05Config, "abpolicy_enabled"):
+    raise RuntimeError("Loaded PI05Config does not contain the ABPolicy implementation")
+PY
+
 accelerate launch \
   --use_deepspeed \
   --zero_stage=2 \
@@ -29,7 +45,7 @@ accelerate launch \
   --mixed_precision=bf16 \
   "$(which lerobot-train)" \
   --dataset.repo_id=/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_full \
-  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_abpolicy \
+  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_cylinder_full_abpolicy_10ksteps \
   --job_name=pi05_abpolicy \
   --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
   --policy.repo_id=local/pi05-abpolicy \
