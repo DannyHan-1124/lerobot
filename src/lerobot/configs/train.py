@@ -31,7 +31,7 @@ from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
 from .default import DatasetConfig, EvalConfig, PeftConfig, WandBConfig
-from .policies import PreTrainedConfig
+from .policies import PreTrainedConfig, migrate_legacy_null_rtc_config
 from .rewards import RewardModelConfig
 
 TRAIN_CONFIG_NAME = "train_config.json"
@@ -271,6 +271,13 @@ class TrainPipelineConfig(HubMixin):
             with open(config_file) as f:
                 config = json.load(f)
             migrated_config = _migrate_legacy_rabc_fields(config)
+            base_config = migrated_config if migrated_config is not None else config
+            policy_config = base_config.get("policy")
+            if isinstance(policy_config, dict):
+                migrated_policy = migrate_legacy_null_rtc_config(policy_config)
+                if migrated_policy is not None:
+                    migrated_config = dict(base_config)
+                    migrated_config["policy"] = migrated_policy
             if migrated_config is not None:
                 with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
                     json.dump(migrated_config, f)

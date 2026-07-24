@@ -4,13 +4,13 @@
 #SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=10
 #SBATCH -J pi05_abpolicy
-#SBATCH -o logs/pi05_cylinder_full_abpolicy_10ksteps/%x_%j.out
-#SBATCH -e logs/pi05_cylinder_full_abpolicy_10ksteps/%x_%j.err
+#SBATCH -o logs/pi05_moving_can_abpolicy_10ksteps/%x_%j.out
+#SBATCH -e logs/pi05_moving_can_abpolicy_10ksteps/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
-mkdir -p logs/pi05_cylinder_full_abpolicy_10ksteps
+mkdir -p logs/pi05_moving_can_abpolicy_10ksteps
 export PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}"
 
 module purge
@@ -44,8 +44,8 @@ accelerate launch \
   --num_processes=4 \
   --mixed_precision=bf16 \
   "$(which lerobot-train)" \
-  --dataset.repo_id=/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_full \
-  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_cylinder_full_abpolicy_10ksteps \
+  --dataset.repo_id=/hkfs/work/workspace/scratch/utphd-myspace/datasets/put_moving_can_in_bowl \
+  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_moving_can_abpolicy_10ksteps \
   --job_name=pi05_abpolicy \
   --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
   --policy.repo_id=local/pi05-abpolicy \

@@ -37,6 +37,15 @@ T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
 
 
+def migrate_legacy_null_rtc_config(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Remove the obsolete disabled RTC field without accepting RTC checkpoints."""
+    if "rtc_config" not in config or config["rtc_config"] is not None:
+        return None
+    migrated_config = dict(config)
+    migrated_config.pop("rtc_config")
+    return migrated_config
+
+
 @dataclass
 class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: ignore[misc,name-defined] #TODO: draccus issue
     """
@@ -203,15 +212,23 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
+        if config_file is None:
+            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
+
+        with open(config_file) as f:
+            config = json.load(f)
+        migrated_config = migrate_legacy_null_rtc_config(config)
+        if migrated_config is not None:
+            with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
+                json.dump(migrated_config, f)
+                config_file = f.name
+
         # HACK: Parse the original config to get the config subclass, so that we can
         # apply cli overrides.
         # This is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
         with draccus.config_type("json"):
             orig_config = draccus.parse(cls, config_file, args=[])
-
-        if config_file is None:
-            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
         with open(config_file) as f:
             config = json.load(f)
