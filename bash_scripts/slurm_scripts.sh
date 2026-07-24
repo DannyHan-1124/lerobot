@@ -3,15 +3,16 @@
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=10
-#SBATCH -J pi05_bs256_10ksteps_fixed_index
-#SBATCH -o logs/pi05_bs256_10ksteps_fixed_index/%x_%j.out
-#SBATCH -e logs/pi05_bs256_10ksteps_fixed_index/%x_%j.err
+#SBATCH -J pi05_moving_cup_10ksteps_new
+#SBATCH -o logs/pi05_moving_cup_10ksteps_new/%x_%j.out
+#SBATCH -e logs/pi05_moving_cup_10ksteps_new/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
+export PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}"
 
-mkdir -p logs/pi05_bs256_10ksteps_fixed_index
+mkdir -p logs/pi05_moving_cup_10ksteps_new
 
 module purge
 module use /software/easybuild/modules/all
@@ -23,7 +24,7 @@ conda activate lerobot
 
 source bash_scripts/env_lerobot.sh
 
-export DATASET_DIR=/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_cube_full
+export DATASET_DIR=/hkfs/work/workspace/scratch/utphd-myspace/datasets/moving_cup
 export HF_DATASETS_CACHE=$PROJECT_WS/hf_cache/datasets_fixed_index_20260605
 mkdir -p "$HF_DATASETS_CACHE"
 
@@ -47,36 +48,6 @@ if not torch.cuda.is_available():
     sys.exit("CUDA is not available to PyTorch; aborting instead of falling back to CPU.")
 PY
 
-python - <<'PY'
-from pathlib import Path
-
-import pandas as pd
-import pyarrow.parquet as pq
-
-dataset = Path("/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_cube_full")
-episodes_path = dataset / "meta/episodes/chunk-000/file-000.parquet"
-episodes = pd.read_parquet(episodes_path)
-
-parts = []
-for parquet_path in sorted((dataset / "data").glob("*/*.parquet")):
-    parts.append(pq.read_table(parquet_path, columns=["episode_index", "index"]).to_pandas())
-
-data = pd.concat(parts, ignore_index=True)
-actual = data.groupby("episode_index")["index"].agg(["min", "max", "count"]).reset_index()
-merged = episodes.merge(actual, on="episode_index", how="left")
-merged["actual_to"] = merged["max"] + 1
-bad = merged[
-    (merged["dataset_from_index"] != merged["min"])
-    | (merged["dataset_to_index"] != merged["actual_to"])
-    | (merged["length"] != merged["count"])
-]
-if len(bad) > 0:
-    print(bad[["episode_index", "dataset_from_index", "dataset_to_index", "length", "min", "actual_to", "count"]])
-    raise SystemExit("Dataset episode metadata is not repaired; aborting training.")
-
-print(f"Dataset index sanity check passed for {len(episodes)} episodes.")
-PY
-
 accelerate launch \
   --use_deepspeed \
   --zero_stage=2 \
@@ -85,8 +56,8 @@ accelerate launch \
   --mixed_precision=bf16 \
   "$(which lerobot-train)" \
   --dataset.repo_id="$DATASET_DIR" \
-  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps_fixed_index \
-  --job_name=pi05_bs256_10ksteps_fixed_index \
+  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_moving_cup_10ksteps_new \
+  --job_name=pi05_moving_cup_10ksteps_new \
   --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
   --policy.repo_id=local/pi05-test \
   --policy.push_to_hub=false \
@@ -98,7 +69,7 @@ accelerate launch \
   --policy.scheduler_warmup_steps=1000 \
   --policy.scheduler_decay_steps=20000 \
   --policy.scheduler_decay_lr=2.5e-06 \
-  --save_freq=2500 \
+  --save_freq=5000 \
   --gradient_accumulation_steps=4 \
   --steps=10000 \
   --batch_size=16
