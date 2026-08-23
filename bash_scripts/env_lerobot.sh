@@ -10,6 +10,7 @@ export TRANSFORMERS_CACHE=$HF_HOME/transformers
 
 # Set hf token
 
+
 # torch / cache
 export TORCH_HOME=$PROJECT_WS/torch_cache
 export XDG_CACHE_HOME=$PROJECT_WS/xdg_cache

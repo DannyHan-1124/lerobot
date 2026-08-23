@@ -1,0 +1,10 @@
+{
+  "put red cylinder on red cube": "red cylinder",
+  "put red cylinder on green cube": "red cylinder",
+  "put red cylinder on blue cube": "red cylinder",
+  "put red cylinder on yellow cube": "red cylinder",
+  "put green cylinder on green cube": "green cylinder",
+  "put green cylinder on red cube": "green cylinder",
+  "put green cylinder on yellow cube": "green cylinder",
+  "put green cylinder on blue cube": "green cylinder"
+}

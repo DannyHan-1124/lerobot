@@ -56,14 +56,12 @@ from lerobot.utils.constants import (
 )
 
 from ..pretrained import PreTrainedPolicy, T
-from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from .puma import PUMA_FUTURE_FEATURES, PUMA_FUTURE_VALID, dense_flow_rgb
 
 
 class ActionSelectKwargs(TypedDict, total=False):
-    inference_delay: int | None
-    prev_chunk_left_over: Tensor | None
-    execution_horizon: int | None
+    pass
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -563,10 +561,9 @@ class PaliGemmaWithExpertModel(
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI05 PyTorch model."""
 
-    def __init__(self, config: PI05Config, rtc_processor: RTCProcessor | None = None):
+    def __init__(self, config: PI05Config):
         super().__init__()
         self.config = config
-        self.rtc_processor = rtc_processor
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -591,6 +588,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+
+        if config.puma_config.enabled:
+            self.world_queries = nn.Parameter(
+                torch.empty(config.puma_config.future_steps, paligemma_config.width)
+            )
+            nn.init.normal_(self.world_queries, std=0.02)
+            self.world_out_proj = nn.Linear(
+                paligemma_config.width, config.puma_config.future_feature_dim
+            )
+        else:
+            self.register_parameter("world_queries", None)
+            self.world_out_proj = None
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -617,9 +626,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
-
-    def _rtc_enabled(self):
-        return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -682,6 +688,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        if self.world_queries is not None:
+            world_emb = self.world_queries[None].expand(lang_emb.shape[0], -1, -1)
+            world_emb = world_emb.to(dtype=lang_emb.dtype, device=lang_emb.device)
+            embs.append(world_emb)
+            pad_masks.append(
+                torch.ones(world_emb.shape[:2], dtype=torch.bool, device=lang_emb.device)
+            )
+            att_masks += [0] * world_emb.shape[1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -777,7 +792,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -785,9 +800,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
@@ -801,7 +816,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         u_t = u_t.to(dtype=v_t.dtype)
-        return F.mse_loss(u_t, v_t, reduction="none")
+        world_predictions = None
+        if self.world_out_proj is not None:
+            world_predictions = self.world_out_proj(
+                prefix_out[:, -self.config.puma_config.future_steps :].float()
+            )
+        return F.mse_loss(u_t, v_t, reduction="none"), world_predictions
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -860,26 +880,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     timestep=current_timestep,
                 )
 
-            if self._rtc_enabled():
-                inference_delay = kwargs.get("inference_delay")
-                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
-                execution_horizon = kwargs.get("execution_horizon")
-
-                v_t = self.rtc_processor.denoise_step(
-                    x_t=x_t,
-                    prev_chunk_left_over=prev_chunk_left_over,
-                    inference_delay=inference_delay,
-                    time=time,
-                    original_denoise_step_partial=denoise_step_partial_call,
-                    execution_horizon=execution_horizon,
-                )
-            else:
-                v_t = denoise_step_partial_call(x_t)
+            v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
-
-            if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
         return x_t
 
@@ -944,8 +947,7 @@ class PI05Policy(PreTrainedPolicy):
         self.config = config
 
         # Initialize the core PI05 model
-        self.init_rtc_processor()
-        self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+        self.model = PI05Pytorch(config)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1043,7 +1045,8 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            load_strict = strict and not model.config.puma_config.enabled
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=load_strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1154,22 +1157,6 @@ class PI05Policy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
 
-    def init_rtc_processor(self):
-        """Initialize RTC processor if RTC is enabled in config."""
-        self.rtc_processor = None
-
-        # Create processor if config provided
-        # If RTC is not enabled - we can still track the denoising data
-        if self.config.rtc_config is not None:
-            self.rtc_processor = RTCProcessor(self.config.rtc_config)
-
-            model_value = getattr(self, "model", None)
-            if model_value is not None:
-                model_value.rtc_processor = self.rtc_processor
-
-    def _rtc_enabled(self) -> bool:
-        return self.config.rtc_config is not None and self.config.rtc_config.enabled
-
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
@@ -1194,6 +1181,29 @@ class PI05Policy(PreTrainedPolicy):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key]
+
+            flow_maps = None
+            if self.config.puma_config.enabled and key == self.config.puma_config.flow_camera_key:
+                if img.ndim != 5:
+                    raise ValueError(
+                        f"PUMA expects {key} with shape (B, history+1, C, H, W), got {tuple(img.shape)}"
+                    )
+                if img.shape[1] != self.config.puma_config.history_steps + 1:
+                    raise ValueError(
+                        f"PUMA expected {self.config.puma_config.history_steps + 1} frames for {key}, "
+                        f"got {img.shape[1]}"
+                    )
+                temporal = img.float()
+                if temporal.max() > 1.0:
+                    temporal = temporal / 255.0
+                flow_maps = dense_flow_rgb(
+                    temporal[:, :-1],
+                    temporal[:, -1],
+                    resolution=self.config.puma_config.flow_resolution,
+                    magnitude_percentile=self.config.puma_config.flow_magnitude_percentile,
+                    noise_threshold=self.config.puma_config.flow_noise_threshold,
+                )
+                img = temporal[:, -1]
 
             # Ensure tensor is on the same device as the model
             if img.device != device:
@@ -1236,6 +1246,16 @@ class PI05Policy(PreTrainedPolicy):
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
             img_masks.append(mask)
 
+            if flow_maps is not None:
+                for flow_idx in range(flow_maps.shape[1]):
+                    flow_img = flow_maps[:, flow_idx]
+                    if flow_img.shape[-2:] != self.config.image_resolution:
+                        flow_img = F.interpolate(
+                            flow_img, size=self.config.image_resolution, mode="bilinear", align_corners=False
+                        )
+                    images.append(flow_img * 2.0 - 1.0)
+                    img_masks.append(torch.ones_like(mask))
+
         # Create image features not present in the batch as fully 0 padded images
         for _num_empty_cameras in range(len(missing_img_keys)):
             img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
@@ -1253,10 +1273,6 @@ class PI05Policy(PreTrainedPolicy):
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
-        assert not self._rtc_enabled(), (
-            "RTC is not supported for select_action, use it with predict_action_chunk"
-        )
-
         self.eval()
 
         # Action queue logic for n_action_steps > 1
@@ -1304,7 +1320,7 @@ class PI05Policy(PreTrainedPolicy):
         time = self.model.sample_time(actions.shape[0], actions.device)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
+        losses, world_predictions = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1314,14 +1330,31 @@ class PI05Policy(PreTrainedPolicy):
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().float().cpu().numpy().tolist(),
         }
 
+        world_per_sample = torch.zeros(losses.shape[0], device=losses.device)
+        if self.config.puma_config.enabled:
+            if PUMA_FUTURE_FEATURES not in batch or world_predictions is None:
+                raise KeyError(
+                    f"PUMA training requires {PUMA_FUTURE_FEATURES!r}; generate a sidecar cache first"
+                )
+            targets = batch[PUMA_FUTURE_FEATURES].to(world_predictions.device).float()
+            valid = batch.get(PUMA_FUTURE_VALID)
+            if valid is None:
+                valid = torch.ones(targets.shape[:2], dtype=torch.bool, device=targets.device)
+            else:
+                valid = valid.to(targets.device).bool()
+            cosine = 1.0 - F.cosine_similarity(world_predictions.float(), targets, dim=-1)
+            world_per_sample = (cosine * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+            loss_dict["world_loss"] = world_per_sample.mean().item()
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = per_sample_loss + self.config.puma_config.world_loss_weight * world_per_sample
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = losses.mean() + self.config.puma_config.world_loss_weight * world_per_sample.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

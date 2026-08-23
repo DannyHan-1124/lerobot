@@ -20,7 +20,7 @@ from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTr
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
-from ..rtc.configuration_rtc import RTCConfig
+from .configuration_puma import PUMAConfig
 
 DEFAULT_IMAGE_SIZE = 224
 
@@ -56,8 +56,8 @@ class PI05Config(PreTrainedConfig):
     # Populated at runtime from dataset metadata by make_policy.
     action_feature_names: list[str] | None = None
 
-    # Real-Time Chunking (RTC) configuration
-    rtc_config: RTCConfig | None = None
+    # Predictive Unified Manipulation Architecture (PUMA)
+    puma_config: PUMAConfig = field(default_factory=PUMAConfig)
 
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
@@ -163,8 +163,12 @@ class PI05Config(PreTrainedConfig):
         )
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list[int] | None:
+        if not self.puma_config.enabled:
+            return None
+        h = self.puma_config.history_steps
+        stride = self.puma_config.history_stride
+        return [-(h - i) * stride for i in range(h)] + [0]
 
     @property
     def action_delta_indices(self) -> list:

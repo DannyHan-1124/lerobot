@@ -27,6 +27,7 @@ from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
+from .puma_sidecar import PUMASidecarDataset
 from .streaming_dataset import StreamingLeRobotDataset
 
 
@@ -57,7 +58,13 @@ def resolve_delta_timestamps(
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+            puma_config = getattr(cfg, "puma_config", None)
+            if puma_config is not None and puma_config.enabled:
+                dataset_flow_key = puma_config.dataset_flow_camera_key or puma_config.flow_camera_key
+                if key != dataset_flow_key:
+                    continue
+            else:
+                delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
@@ -128,5 +135,11 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
+    puma_config = getattr(cfg.trainable_config, "puma_config", None)
+    if puma_config is not None and puma_config.enabled:
+        if not puma_config.feature_cache:
+            raise ValueError("PUMA training requires policy.puma_config.feature_cache")
+        dataset = PUMASidecarDataset(dataset, puma_config.feature_cache)
 
     return dataset
