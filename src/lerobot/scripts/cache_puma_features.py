@@ -39,9 +39,13 @@ class PUMATeacher:
 
         self.device = torch.device(args.device)
         self.dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
+        # Grounding DINO's text-enhancer path creates some activations in FP32.
+        # Loading its weights in BF16 therefore causes dtype mismatches in
+        # Transformers versions where that path is not autocast-safe.
+        self.ground_dtype = torch.float32
         self.ground_processor = AutoProcessor.from_pretrained(args.grounding_model)
         self.ground_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-            args.grounding_model, dtype=self.dtype
+            args.grounding_model, dtype=self.ground_dtype
         ).to(self.device).eval()
         self.sam_processor = Sam2Processor.from_pretrained(args.sam_model)
         self.sam_model = Sam2Model.from_pretrained(args.sam_model, dtype=self.dtype).to(self.device).eval()
@@ -51,21 +55,27 @@ class PUMATeacher:
         self.text_threshold = args.text_threshold
         self.feature_dim = int(self.dino_model.config.hidden_size)
 
-    def _prepare_inputs(self, inputs: dict[str, object]) -> dict[str, object]:
+    def _prepare_inputs(
+        self, inputs: dict[str, object], dtype: torch.dtype | None = None
+    ) -> dict[str, object]:
+        dtype = self.dtype if dtype is None else dtype
         prepared = {}
         for key, value in inputs.items():
             if not torch.is_tensor(value):
                 prepared[key] = value
             elif value.is_floating_point():
-                prepared[key] = value.to(device=self.device, dtype=self.dtype)
+                prepared[key] = value.to(device=self.device, dtype=dtype)
             else:
                 prepared[key] = value.to(self.device)
         return prepared
 
     @torch.inference_mode()
     def __call__(self, image: Image.Image, prompt: str) -> tuple[np.ndarray, bool, float]:
+        prompt = prompt.strip().lower()
+        if not prompt.endswith("."):
+            prompt += "."
         ground = self.ground_processor(images=image, text=prompt, return_tensors="pt")
-        ground = self._prepare_inputs(ground)
+        ground = self._prepare_inputs(ground, dtype=self.ground_dtype)
         outputs = self.ground_model(**ground)
         detections = self.ground_processor.post_process_grounded_object_detection(
             outputs,
@@ -80,7 +90,8 @@ class PUMATeacher:
         box = detections["boxes"][best].detach().cpu().tolist()
         score = float(detections["scores"][best].item())
 
-        sam = self.sam_processor(images=image, input_boxes=[[[box]]], return_tensors="pt")
+        # SAM2 expects [image][box][x0, y0, x1, y1].
+        sam = self.sam_processor(images=image, input_boxes=[[box]], return_tensors="pt")
         sam = self._prepare_inputs(sam)
         sam_outputs = self.sam_model(**sam, multimask_output=False)
         masks = self.sam_processor.post_process_masks(
@@ -116,8 +127,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grounding-model", default="IDEA-Research/grounding-dino-tiny")
     parser.add_argument("--sam-model", default="facebook/sam2.1-hiera-large")
     parser.add_argument("--dino-model", default="facebook/dinov2-base")
-    parser.add_argument("--box-threshold", type=float, default=0.35)
-    parser.add_argument("--text-threshold", type=float, default=0.25)
+    parser.add_argument("--box-threshold", type=float, default=0.20)
+    parser.add_argument("--text-threshold", type=float, default=0.15)
     return parser.parse_args()
 
 
@@ -143,6 +154,7 @@ def episode_cache_is_complete(path: Path, expected_length: int, future_steps: in
                 and data["features"].shape[:2] == (expected_length, future_steps)
                 and data["valid"].shape == (expected_length, future_steps)
                 and data["scores"].shape == (expected_length, future_steps)
+                and bool(data["valid"].any())
             )
     except (OSError, ValueError, KeyError):
         return False
@@ -258,8 +270,19 @@ def main() -> None:
             )
 
         destination = output_dir / f"episode_{episode_index:06d}.npz"
+        valid_count = sum(int(row[2].sum()) for row in rows)
+        if valid_count == 0:
+            raise RuntimeError(
+                f"Grounding DINO found no targets in episode {episode_index}; refusing to save an "
+                "all-zero cache. Try a broader target prompt or lower detection thresholds."
+            )
         save_episode(destination, rows)
-        print(f"Saved episode {episode_index} to {destination}", flush=True)
+        total_count = sum(int(row[2].size) for row in rows)
+        print(
+            f"Saved episode {episode_index} to {destination} "
+            f"({valid_count}/{total_count} valid targets)",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
