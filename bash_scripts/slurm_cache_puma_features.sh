@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH --gres=gpu:1
-#SBATCH --time=12:00:00
+#SBATCH --time=4:00:00
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=64G
-#SBATCH -J cache_puma_cylinder_full
+#SBATCH -J cache_puma_conveyor_cube
 #SBATCH -o logs/%x_%j.out
 #SBATCH -e logs/%x_%j.err
 
@@ -12,7 +12,7 @@ set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
 export PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}"
-mkdir -p logs/cache_puma_cylinder_full
+mkdir -p logs/cache_puma_conveyor_cube
 
 module purge
 module use /software/easybuild/modules/all

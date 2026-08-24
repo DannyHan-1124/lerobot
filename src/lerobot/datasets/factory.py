@@ -63,8 +63,7 @@ def resolve_delta_timestamps(
                 dataset_flow_key = puma_config.dataset_flow_camera_key or puma_config.flow_camera_key
                 if key != dataset_flow_key:
                     continue
-            else:
-                delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
