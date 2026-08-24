@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH --gres=gpu:4
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=20
-#SBATCH -J pi05_puma_cylinder_full_10k
+#SBATCH -J pi05_puma_conveyor_cube_2k
 #SBATCH -o /hkfs/work/workspace/scratch/utphd-myspace/lerobot/logs/%x_%j.out
 #SBATCH -e /hkfs/work/workspace/scratch/utphd-myspace/lerobot/logs/%x_%j.err
 
@@ -12,7 +12,7 @@ set -euo pipefail
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
 export PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}"
 
-mkdir -p logs/pi05_puma_cylinder_full_10k
+mkdir -p logs/pi05_puma_conveyor_cube_2k
 
 module purge
 module use /software/easybuild/modules/all
@@ -24,10 +24,10 @@ conda activate lerobot
 
 source bash_scripts/env_lerobot.sh
 
-export DATASET_DIR=/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_full
-export PUMA_FEATURE_CACHE=/hkfs/work/workspace/scratch/utphd-myspace/puma_features/cylinder_full
-export OUTPUT_DIR=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_puma_cylinder_full_10k
-export HF_DATASETS_CACHE=$PROJECT_WS/hf_cache/puma_cylinder_full
+export DATASET_DIR=/hkfs/work/workspace/scratch/utphd-myspace/datasets/conveyor_cube
+export PUMA_FEATURE_CACHE=/hkfs/work/workspace/scratch/utphd-myspace/puma_features/conveyor_cube
+export OUTPUT_DIR=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_puma_conveyor_cube_2k
+export HF_DATASETS_CACHE=$PROJECT_WS/hf_cache/puma_conveyor_cube
 mkdir -p "$HF_DATASETS_CACHE"
 
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
@@ -61,9 +61,9 @@ accelerate launch \
   "$(which lerobot-train)" \
   --dataset.repo_id="$DATASET_DIR" \
   --output_dir="$OUTPUT_DIR" \
-  --job_name=pi05_puma_cylinder_full_10k \
+  --job_name=pi05_puma_conveyor_cube_2k \
   --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
-  --policy.repo_id=local/pi05-puma-cylinder-full \
+  --policy.repo_id=local/pi05-puma-conveyor-cube \
   --policy.push_to_hub=false \
   --rename_map='{"observation.images.static_cam": "observation.images.base_0_rgb", "observation.images.wrist_cam": "observation.images.left_wrist_0_rgb"}' \
   --policy.puma_config.enabled=true \
@@ -80,12 +80,12 @@ accelerate launch \
   --policy.device=cuda \
   --policy.gradient_checkpointing=true \
   --policy.optimizer_lr=5e-05 \
-  --policy.scheduler_warmup_steps=1000 \
-  --policy.scheduler_decay_steps=20000 \
+  --policy.scheduler_warmup_steps=200 \
+  --policy.scheduler_decay_steps=2000 \
   --policy.scheduler_decay_lr=2.5e-06 \
-  --save_freq=5000 \
+  --save_freq=500 \
   --log_freq=20 \
   --num_workers=4 \
   --gradient_accumulation_steps=8 \
-  --steps=10000 \
+  --steps=2000 \
   --batch_size=8
