@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH --gres=gpu:4
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=20
 #SBATCH -J pi05_puma_conveyor_cube_2k
 #SBATCH -o /hkfs/work/workspace/scratch/utphd-myspace/lerobot/logs/%x_%j.out
