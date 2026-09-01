@@ -818,9 +818,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         u_t = u_t.to(dtype=v_t.dtype)
         world_predictions = None
         if self.world_out_proj is not None:
-            world_predictions = self.world_out_proj(
-                prefix_out[:, -self.config.puma_config.future_steps :].float()
+            world_hidden = prefix_out[:, -self.config.puma_config.future_steps :].to(
+                dtype=self.world_out_proj.weight.dtype
             )
+            world_predictions = self.world_out_proj(world_hidden)
         return F.mse_loss(u_t, v_t, reduction="none"), world_predictions
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
@@ -1194,6 +1195,15 @@ class PI05Policy(PreTrainedPolicy):
                         f"got {img.shape[1]}"
                     )
                 temporal = img.float()
+                if temporal.shape[2] == 3:
+                    pass
+                elif temporal.shape[-1] == 3:
+                    temporal = temporal.permute(0, 1, 4, 2, 3).contiguous()
+                else:
+                    raise ValueError(
+                        f"PUMA could not identify the RGB channel dimension for {key}: "
+                        f"expected (B, T, C, H, W) or (B, T, H, W, C), got {tuple(img.shape)}"
+                    )
                 if temporal.max() > 1.0:
                     temporal = temporal / 255.0
                 flow_maps = dense_flow_rgb(
@@ -1223,11 +1233,15 @@ class PI05Policy(PreTrainedPolicy):
                     img = img / 255.0
             
             # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
-
-            if is_channels_first:
+            if img.ndim != 4:
+                raise ValueError(f"Expected a 4D image tensor for {key}, got {tuple(img.shape)}")
+            if img.shape[1] == 3:
                 # Convert [B, C, H, W] to [B, H, W, C] for processing
                 img = img.permute(0, 2, 3, 1)
+            elif img.shape[-1] != 3:
+                raise ValueError(
+                    f"Could not identify the RGB channel dimension for {key}: got {tuple(img.shape)}"
+                )
 
             # from openpi preprocess_observation_pytorch: Resize with padding if needed
             if img.shape[1:3] != self.config.image_resolution:
@@ -1236,9 +1250,8 @@ class PI05Policy(PreTrainedPolicy):
             # Normalize from [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0
 
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
-            if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+            # SigLIP always expects [B, C, H, W], regardless of the input layout.
+            img = img.permute(0, 3, 1, 2).contiguous()
 
             images.append(img)
             # Create mask (all ones for real images)

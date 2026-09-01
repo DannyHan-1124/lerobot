@@ -4,8 +4,10 @@ import numpy as np
 import torch
 from torch import Tensor
 
-PUMA_FUTURE_FEATURES = "puma.future_features"
-PUMA_FUTURE_VALID = "puma.future_valid"
+# Keep sidecar targets in the observation namespace so LeRobot's
+# batch-to-transition preprocessor preserves and moves them to the policy device.
+PUMA_FUTURE_FEATURES = "observation.puma.future_features"
+PUMA_FUTURE_VALID = "observation.puma.future_valid"
 
 
 def dense_flow_rgb(

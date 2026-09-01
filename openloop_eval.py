@@ -60,6 +60,19 @@ def get_episode_index(sample):
 
 def predict_one_sample(policy, preprocessor, postprocessor, sample, device):
     processed_batch = preprocessor(sample)
+    puma_config = getattr(policy.config, "puma_config", None)
+    if puma_config is not None and puma_config.enabled:
+        flow_camera_key = puma_config.flow_camera_key
+        flow_history = processed_batch.get(flow_camera_key)
+        if not isinstance(flow_history, torch.Tensor):
+            raise KeyError(f"Missing processed PUMA flow history: {flow_camera_key}")
+        if flow_history.ndim == 4:
+            processed_batch[flow_camera_key] = flow_history.unsqueeze(0)
+        elif flow_history.ndim != 5:
+            raise ValueError(
+                f"Expected processed PUMA flow history as (T, C, H, W) or "
+                f"(B, T, C, H, W), got {tuple(flow_history.shape)}"
+            )
     processed_batch = move_to_device(processed_batch, device)
 
     with torch.no_grad():
@@ -81,11 +94,11 @@ def predict_one_sample(policy, preprocessor, postprocessor, sample, device):
 # Config
 # =========================
 
-ckpt_dir = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps_fixed_index/checkpoints/last/pretrained_model"
+ckpt_dir = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_puma_conveyor_cube_2k/checkpoints/001500/pretrained_model"
 
-config_path = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps_fixed_index/checkpoints/last/pretrained_model/train_config.json"
+config_path = "/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_puma_conveyor_cube_2k/checkpoints/001500/pretrained_model/train_config.json"
 
-plot_dir = "/hkfs/work/workspace/scratch/utphd-myspace/lerobot/openloop_eval/pi05_bs256_10ksteps_fixed_index"
+plot_dir = "/hkfs/work/workspace/scratch/utphd-myspace/lerobot/openloop_eval/pi05_puma_conveyor_cube_1500"
 os.makedirs(plot_dir, exist_ok=True)
 
 num_episodes_to_plot = 5
@@ -115,7 +128,15 @@ ensure_attr(cfg, "num_workers", 4)
 ensure_attr(cfg, "tolerance_s", 1e-4)
 ensure_attr(cfg, "rename_map", {})
 cfg.rename_map = namespace_to_dict(cfg.rename_map)
-ensure_attr(cfg.policy, "observation_delta_indices", None)
+puma_config = getattr(cfg.policy, "puma_config", None)
+if puma_config is not None and getattr(puma_config, "enabled", False):
+    history_steps = int(puma_config.history_steps)
+    history_stride = int(puma_config.history_stride)
+    cfg.policy.observation_delta_indices = [
+        -(history_steps - index) * history_stride for index in range(history_steps)
+    ] + [0]
+else:
+    ensure_attr(cfg.policy, "observation_delta_indices", None)
 ensure_attr(cfg.policy, "action_delta_indices", None)
 ensure_attr(cfg.policy, "reward_delta_indices", None)
 ensure_attr(cfg, "trainable_config", cfg.policy)
@@ -130,6 +151,17 @@ print("dataset length:", len(dataset))
 sample0 = dataset[0]
 print("sample keys:", sample0.keys())
 print("action shape:", sample0["action"].shape)
+if puma_config is not None and getattr(puma_config, "enabled", False):
+    flow_camera_key = puma_config.dataset_flow_camera_key or puma_config.flow_camera_key
+    flow_shape = tuple(sample0[flow_camera_key].shape)
+    expected_frames = int(puma_config.history_steps) + 1
+    print(f"PUMA flow history shape ({flow_camera_key}):", flow_shape)
+    print("PUMA observation delta indices:", cfg.policy.observation_delta_indices)
+    if len(flow_shape) != 4 or flow_shape[0] != expected_frames:
+        raise ValueError(
+            f"Expected {flow_camera_key} with shape (history+1, C, H, W) and "
+            f"{expected_frames} frames, got {flow_shape}"
+        )
 
 if hasattr(dataset.meta, "fps"):
     print("dataset fps:", dataset.meta.fps)

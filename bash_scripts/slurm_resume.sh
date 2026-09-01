@@ -2,16 +2,17 @@
 #SBATCH -p accelerated
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
-#SBATCH --cpus-per-task=10
-#SBATCH -J resume_20k
-#SBATCH -o logs/resume_20k/%x_%j.out
-#SBATCH -e logs/resume_20k/%x_%j.err
+#SBATCH --cpus-per-task=20
+#SBATCH -J pi05_puma_cylinder_resume_5000
+#SBATCH -o /hkfs/work/workspace/scratch/utphd-myspace/lerobot/logs/pi05_puma_cylinder_resume_5000/%x_%j.out
+#SBATCH -e /hkfs/work/workspace/scratch/utphd-myspace/lerobot/logs/pi05_puma_cylinder_resume_5000/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
+export PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}"
 
-mkdir -p logs/resume_20k
+mkdir -p logs/pi05_puma_cylinder_resume_5000
 
 module purge
 module use /software/easybuild/modules/all
@@ -20,61 +21,52 @@ module load devel/cuda/12.9
 
 . /hkfs/work/workspace/scratch/utphd-myspace/miniforge3/etc/profile.d/conda.sh
 conda activate lerobot
-
 source bash_scripts/env_lerobot.sh
 
-export DATASET_DIR=/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_cube_full
-export HF_DATASETS_CACHE=$PROJECT_WS/hf_cache/datasets_fixed_index_20260605
+export CHECKPOINT_DIR=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_puma_cylinder_full_10k/checkpoints/005000
+export TRAIN_CONFIG="$CHECKPOINT_DIR/pretrained_model/train_config.json"
+export HF_DATASETS_CACHE=$PROJECT_WS/hf_cache/puma_cylinder_full
 mkdir -p "$HF_DATASETS_CACHE"
 
-export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+export MASTER_PORT=$(expr 10000 + $(echo -n "$SLURM_JOBID" | tail -c 4))
 
 echo "Job ${SLURM_JOB_ID:-unknown} running on $(hostname)"
 echo "Working directory: $(pwd)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "MASTER_PORT=${MASTER_PORT}"
-echo "DATASET_DIR=${DATASET_DIR}"
-echo "HF_DATASETS_CACHE=${HF_DATASETS_CACHE}"
+echo "CHECKPOINT_DIR=${CHECKPOINT_DIR}"
+echo "TRAIN_CONFIG=${TRAIN_CONFIG}"
 nvidia-smi
+
 python - <<'PY'
+import json
+import os
 import sys
+from pathlib import Path
+
 import torch
+
+checkpoint = Path(os.environ["CHECKPOINT_DIR"])
+config = Path(os.environ["TRAIN_CONFIG"])
+step_file = checkpoint / "training_step.json"
+optimizer_dir = checkpoint / "accelerate_state" / "pytorch_model"
 
 print(f"torch={torch.__version__}, torch.version.cuda={torch.version.cuda}")
 print(f"torch.cuda.is_available()={torch.cuda.is_available()}")
 print(f"torch.cuda.device_count()={torch.cuda.device_count()}")
 if not torch.cuda.is_available():
     sys.exit("CUDA is not available to PyTorch; aborting instead of falling back to CPU.")
-PY
-
-python - <<'PY'
-from pathlib import Path
-
-import pandas as pd
-import pyarrow.parquet as pq
-
-dataset = Path("/hkfs/work/workspace/scratch/utphd-myspace/datasets/cylinder_cube_full")
-episodes_path = dataset / "meta/episodes/chunk-000/file-000.parquet"
-episodes = pd.read_parquet(episodes_path)
-
-parts = []
-for parquet_path in sorted((dataset / "data").glob("*/*.parquet")):
-    parts.append(pq.read_table(parquet_path, columns=["episode_index", "index"]).to_pandas())
-
-data = pd.concat(parts, ignore_index=True)
-actual = data.groupby("episode_index")["index"].agg(["min", "max", "count"]).reset_index()
-merged = episodes.merge(actual, on="episode_index", how="left")
-merged["actual_to"] = merged["max"] + 1
-bad = merged[
-    (merged["dataset_from_index"] != merged["min"])
-    | (merged["dataset_to_index"] != merged["actual_to"])
-    | (merged["length"] != merged["count"])
-]
-if len(bad) > 0:
-    print(bad[["episode_index", "dataset_from_index", "dataset_to_index", "length", "min", "actual_to", "count"]])
-    raise SystemExit("Dataset episode metadata is not repaired; aborting training.")
-
-print(f"Dataset index sanity check passed for {len(episodes)} episodes.")
+if torch.cuda.device_count() != 4:
+    sys.exit(f"Expected 4 GPUs for this resume job, found {torch.cuda.device_count()}.")
+if not config.is_file() or not step_file.is_file():
+    sys.exit(f"Incomplete checkpoint: {checkpoint}")
+step = int(json.loads(step_file.read_text())["step"])
+if step != 5000:
+    sys.exit(f"Expected checkpoint step 5000, found {step}.")
+optimizer_shards = sorted(optimizer_dir.glob("bf16_zero_pp_rank_*_optim_states.pt"))
+if len(optimizer_shards) != 4:
+    sys.exit(f"Expected 4 DeepSpeed optimizer shards, found {len(optimizer_shards)}.")
+print(f"Checkpoint validation passed at step {step} with 4 optimizer shards.")
 PY
 
 accelerate launch \
@@ -84,22 +76,7 @@ accelerate launch \
   --num_processes=4 \
   --mixed_precision=bf16 \
   "$(which lerobot-train)" \
-  --dataset.repo_id="$DATASET_DIR" \
-  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_bs256_10ksteps_fixed_index \
-  --job_name=resume_20k \
-  --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
-  --policy.repo_id=local/pi05-resume \
-  --policy.push_to_hub=false \
-  --rename_map='{"observation.images.static_cam": "observation.images.base_0_rgb", "observation.images.wrist_cam": "observation.images.left_wrist_0_rgb"}' \
-  --policy.dtype=bfloat16 \
-  --policy.device=cuda \
-  --policy.gradient_checkpointing=true \
-  --policy.optimizer_lr=5e-05 \
-  --policy.scheduler_warmup_steps=1000 \
-  --policy.scheduler_decay_steps=20000 \
-  --policy.scheduler_decay_lr=2.5e-06 \
-  --save_freq=2500 \
+  --config_path="$TRAIN_CONFIG" \
   --resume=true \
-  --gradient_accumulation_steps=4 \
-  --steps=20000 \
-  --batch_size=16
+  --save_freq=2500 \
+  --steps=10000
