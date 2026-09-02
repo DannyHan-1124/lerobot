@@ -1,17 +1,17 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH --gres=gpu:4
-#SBATCH --time=48:00:00
+#SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=10
-#SBATCH -J pi05_moving_can_FASTER_10ksteps
-#SBATCH -o logs/pi05_moving_can_FASTER_10ksteps/%x_%j.out
-#SBATCH -e logs/pi05_moving_can_FASTER_10ksteps/%x_%j.err
+#SBATCH -J pi05_conveyor_cube_FASTER_2ksteps
+#SBATCH -o logs/pi05_conveyor_cube_FASTER_2ksteps/%x_%j.out
+#SBATCH -e logs/pi05_conveyor_cube_FASTER_2ksteps/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
 
-mkdir -p logs/pi05_moving_can_FASTER_10ksteps
+mkdir -p logs/pi05_conveyor_cube_FASTER_2ksteps
 
 module purge
 module use /software/easybuild/modules/all
@@ -23,8 +23,8 @@ conda activate lerobot
 
 source bash_scripts/env_lerobot.sh
 
-export DATASET_DIR=/hkfs/work/workspace/scratch/utphd-myspace/datasets/put_moving_can_in_bowl
-export HF_DATASETS_CACHE=$PROJECT_WS/hf_cache/datasets_put_moving_can_in_bowl
+export DATASET_DIR=/hkfs/work/workspace/scratch/utphd-myspace/datasets/conveyor_cube
+export HF_DATASETS_CACHE=$PROJECT_WS/hf_cache/datasets_conveyor_cube
 mkdir -p "$HF_DATASETS_CACHE"
 
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
@@ -89,8 +89,8 @@ accelerate launch \
   --mixed_precision=bf16 \
   "$(which lerobot-train)" \
   --dataset.repo_id="$DATASET_DIR" \
-  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_moving_can_FASTER_10ksteps \
-  --job_name=pi05_moving_can_FASTER_10ksteps \
+  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_conveyor_cube_FASTER_2ksteps \
+  --job_name=pi05_conveyor_cube_FASTER_2ksteps \
   --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
   --policy.repo_id=local/pi05-test \
   --policy.push_to_hub=false \
@@ -99,14 +99,14 @@ accelerate launch \
   --policy.device=cuda \
   --policy.gradient_checkpointing=true \
   --policy.optimizer_lr=5e-05 \
-  --policy.scheduler_warmup_steps=1000 \
-  --policy.scheduler_decay_steps=20000 \
+  --policy.scheduler_warmup_steps=200 \
+  --policy.scheduler_decay_steps=2000 \
   --policy.scheduler_decay_lr=2.5e-06 \
   --policy.faster_train_max_delay=10 \
   --policy.faster_train_mix_prob=0.5 \
   --policy.faster_train_alpha=0.6 \
   --policy.faster_train_u0=0.9 \
-  --save_freq=10000 \
+  --save_freq=500 \
   --gradient_accumulation_steps=4 \
-  --steps=10000 \
+  --steps=2000 \
   --batch_size=16
