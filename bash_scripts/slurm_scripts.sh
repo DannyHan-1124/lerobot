@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH --gres=gpu:4
-#SBATCH --time=48:00:00
+#SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=10
-#SBATCH -J pi05_abpolicy
-#SBATCH -o logs/pi05_moving_can_abpolicy_10ksteps/%x_%j.out
-#SBATCH -e logs/pi05_moving_can_abpolicy_10ksteps/%x_%j.err
+#SBATCH -J pi05_conveyor_cube_abpolicy_2ksteps
+#SBATCH -o logs/pi05_conveyor_cube_abpolicy_2ksteps/%x_%j.out
+#SBATCH -e logs/pi05_conveyor_cube_abpolicy_2ksteps/%x_%j.err
 
 set -euo pipefail
 
 cd /hkfs/work/workspace/scratch/utphd-myspace/lerobot
-mkdir -p logs/pi05_moving_can_abpolicy_10ksteps
+mkdir -p logs/pi05_conveyor_cube_abpolicy_2ksteps
 export PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}"
 
 module purge
@@ -44,8 +44,8 @@ accelerate launch \
   --num_processes=4 \
   --mixed_precision=bf16 \
   "$(which lerobot-train)" \
-  --dataset.repo_id=/hkfs/work/workspace/scratch/utphd-myspace/datasets/put_moving_can_in_bowl \
-  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_moving_can_abpolicy_10ksteps \
+  --dataset.repo_id=/hkfs/work/workspace/scratch/utphd-myspace/datasets/conveyor_cube \
+  --output_dir=/hkfs/work/workspace/scratch/utphd-myspace/outputs/pi05_conveyor_cube_abpolicy_2ksteps \
   --job_name=pi05_abpolicy \
   --policy.path=/hkfs/work/workspace/scratch/utphd-myspace/models/pi05_base \
   --policy.repo_id=local/pi05-abpolicy \
@@ -54,6 +54,10 @@ accelerate launch \
   --policy.dtype=bfloat16 \
   --policy.device=cuda \
   --policy.gradient_checkpointing=true \
+  --policy.optimizer_lr=5e-05 \
+  --policy.scheduler_warmup_steps=200 \
+  --policy.scheduler_decay_steps=2000 \
+  --policy.scheduler_decay_lr=2.5e-06 \
   --policy.abpolicy_enabled=true \
   --policy.chunk_size=8 \
   --policy.n_action_steps=32 \
@@ -64,7 +68,8 @@ accelerate launch \
   --policy.abpolicy_num_free_control_points=4 \
   --policy.abpolicy_action_representation=cartesian_rotvec \
   --policy.use_relative_actions=false \
-  --save_freq=5000 \
+  --save_freq=500 \
+  --log_freq=20 \
   --gradient_accumulation_steps=4 \
-  --steps=10000 \
+  --steps=2000 \
   --batch_size=16
